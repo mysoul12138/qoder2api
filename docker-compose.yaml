@@ -1,0 +1,10 @@
+services:
+  qoder2api:
+    build: .
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "8963:8963"
+    environment:
+      QODER_HOST: 0.0.0.0
+      QODER_PORT: 8963

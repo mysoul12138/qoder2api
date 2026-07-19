@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.ruff_cache/
+*.egg-info/
+
+# 备份
+*.bak
+*.bak.*
+
+# 本地运行产物
+.env
+*.log
+*.tar.gz
+
+# 系统
+.DS_Store
+Thumbs.db
