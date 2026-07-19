@@ -3,7 +3,7 @@
 把 [QoderWork](https://qoder.com.cn) 的私有聊天协议反向实现，封装成 **OpenAI 兼容 API**。
 任何支持 OpenAI 接口的客户端，带上你的 Qoder PAT，即可调用 QoderWork 的全部模型额度。
 
-- 纯 Python 实现（flask + httpx + pycryptodome），无 Node / wasm 依赖
+- 纯 Python 实现（fastapi + uvicorn + httpx + pycryptodome），无 Node / wasm 依赖
 - **模型列表动态加载**：从 Qoder 网关实时拉取，网关加减模型本服务自动同步，无需改代码
 - 支持 SSE 流式 / 非流式、多模态（图片）、Tool Calls、深度推理（thinking）
 - 多 PAT 并发隔离（每 PAT 独立会话 + 目录缓存）
@@ -89,7 +89,7 @@ services:
 ### 本地运行
 
 ```bash
-pip install -r requirements.txt   # flask, httpx, pycryptodome
+pip install -r requirements.txt   # fastapi, uvicorn, httpx, pycryptodome
 python openai_bridge.py           # 默认 127.0.0.1:8963
 ```
 
@@ -203,7 +203,7 @@ OpenAI 标准的 `tools` / `tool_choice` 与 `image_url` 多模态输入均支�
 
 ```
 qoder2api/
-├── openai_bridge.py        # Flask 入口 + OpenAiBridge(会话/流式转发) + 路由
+├── openai_bridge.py        # FastAPI 入口 + OpenAiBridge(会话/流式转发) + 路由
 ├── qoder_auth.py           # Qoder 认证/签名/HTTP 客户端 (纯 Python 复刻 wasm)
 ├── transform.py            # OpenAI ↔ Qoder 消息转换 + 流式累积器
 ├── models.py               # 模型目录: 动态解析 + 内置兜底表
@@ -211,7 +211,7 @@ qoder2api/
 ├── test_openai_bridge.py   # 单元测试
 ├── Dockerfile              # python:3.12-slim
 ├── docker-compose.yaml
-└── requirements.txt        # flask, httpx, pycryptodome
+└── requirements.txt        # fastapi, uvicorn, httpx, pycryptodome
 ```
 
 ---
@@ -262,7 +262,7 @@ python -m unittest test_openai_bridge -v   # 19 个测试, 无需联网/PAT
 
 ## 技术栈
 
-- **Python 3.12** · **Flask** · **httpx** · **pycryptodome**
+- **Python 3.12** · **FastAPI** · **uvicorn** · **httpx** · **pycryptodome**
 - **Docker** 容器化部署
 
 ## 许可证

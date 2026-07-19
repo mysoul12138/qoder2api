@@ -21,7 +21,7 @@ import os
 import platform
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from email.utils import formatdate
 from urllib.parse import urlparse
@@ -75,14 +75,14 @@ def model_list_url(region: RegionConfig) -> str:
     return f"{region.chat_base}/algo/api/v2/model/list?Encode=1"
 
 
-def fetch_model_catalog(sess: "SessionContext", region: RegionConfig) -> dict:
+async def fetch_model_catalog(sess: "SessionContext", region: RegionConfig) -> dict:
     """GET 模型目录, 返回解析后的 JSON。
 
     响应为明文 JSON (实测与 chat SSE 端点一致的 Encode=1 行为)。若服务端
     日后改为整包加密, resp.json() 会抛错, 由调用方 (OpenAiBridge.get_catalog)
     捕获并回退到内置兜底表。
     """
-    return call_get(sess, model_list_url(region))
+    return await call_get(sess, model_list_url(region))
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -312,7 +312,7 @@ def _common_headers(
     }
 
 
-def _post_encoded(
+async def _post_encoded(
     url: str, obj: dict, machine_id: str, machine_token: str, machine_type: str
 ) -> dict:
     date = current_date()
@@ -321,8 +321,8 @@ def _post_encoded(
     body = encode(plain)
     headers = _common_headers(machine_id, machine_token, machine_type, date, sig)
 
-    with httpx.Client(timeout=15) as client:
-        resp = client.post(url, content=body.encode("utf-8"), headers=headers)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(url, content=body.encode("utf-8"), headers=headers)
         if resp.status_code != 200:
             detail = resp.text[:300]
             if resp.status_code in (401, 403):
@@ -331,7 +331,7 @@ def _post_encoded(
         return resp.json()
 
 
-def _request_job_token(
+async def _request_job_token(
     personal_token: str,
     refresh_token: str,
     security_oauth_token: str,
@@ -360,10 +360,10 @@ def _request_job_token(
         "payload": json.dumps(inner, separators=(",", ":")),
         "encodeVersion": "1",
     }
-    return _post_encoded(url, outer, machine_id, machine_token, machine_type)
+    return await _post_encoded(url, outer, machine_id, machine_token, machine_type)
 
 
-def exchange_job_token(
+async def exchange_job_token(
     personal_token: str,
     machine_id: str,
     machine_token: str,
@@ -372,7 +372,7 @@ def exchange_job_token(
 ) -> dict:
     """Cold PAT → jobToken exchange (needRefresh=False)."""
     region = region or CN
-    return _request_job_token(
+    return await _request_job_token(
         personal_token=personal_token,
         refresh_token="",
         security_oauth_token="",
@@ -384,7 +384,7 @@ def exchange_job_token(
     )
 
 
-def refresh_job_token(
+async def refresh_job_token(
     personal_token: str,
     refresh_token: str,
     security_oauth_token: str,
@@ -401,7 +401,7 @@ def refresh_job_token(
     graceful renewal rather than a cold re-exchange.
     """
     region = region or CN
-    return _request_job_token(
+    return await _request_job_token(
         personal_token=personal_token,
         refresh_token=refresh_token,
         security_oauth_token=security_oauth_token,
@@ -413,7 +413,7 @@ def refresh_job_token(
     )
 
 
-def user_status(
+async def user_status(
     user_id: str,
     machine_id: str,
     machine_token: str,
@@ -434,10 +434,10 @@ def user_status(
         "payload": json.dumps(inner, separators=(",", ":")),
         "encodeVersion": "1",
     }
-    return _post_encoded(url, outer, machine_id, machine_token, machine_type)
+    return await _post_encoded(url, outer, machine_id, machine_token, machine_type)
 
 
-def heartbeat(
+async def heartbeat(
     machine_id: str,
     machine_token: str,
     machine_type: str,
@@ -458,7 +458,7 @@ def heartbeat(
         "ide_version": "0.1.43",
         "extra_info": {},
     }
-    return _post_encoded(url, hb, machine_id, machine_token, machine_type)
+    return await _post_encoded(url, hb, machine_id, machine_token, machine_type)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -505,15 +505,15 @@ def _sig_path(full_url: str) -> str:
     return path
 
 
-def call_post(sess: SessionContext, full_url: str, json_body: dict) -> dict:
-    return _call(sess, "POST", full_url, json_body, None)
+async def call_post(sess: SessionContext, full_url: str, json_body: dict) -> dict:
+    return await _call(sess, "POST", full_url, json_body, None)
 
 
-def call_get(sess: SessionContext, full_url: str) -> dict:
-    return _call(sess, "GET", full_url, None, None)
+async def call_get(sess: SessionContext, full_url: str) -> dict:
+    return await _call(sess, "GET", full_url, None, None)
 
 
-def _call(
+async def _call(
     sess: SessionContext,
     method: str,
     full_url: str,
@@ -532,11 +532,13 @@ def _call(
     if extra_headers:
         headers.update(extra_headers)
 
-    with httpx.Client(timeout=30) as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         if method == "POST":
-            resp = client.post(full_url, content=body.encode("utf-8"), headers=headers)
+            resp = await client.post(
+                full_url, content=body.encode("utf-8"), headers=headers
+            )
         else:
-            resp = client.get(full_url, headers=headers)
+            resp = await client.get(full_url, headers=headers)
         if resp.status_code != 200:
             detail = resp.text[:300]
             if resp.status_code in (401, 403):
@@ -545,14 +547,13 @@ def _call(
         return resp.json()
 
 
-def open_stream_lines(
+async def open_stream_lines(
     sess: SessionContext,
     full_url: str,
     json_body: dict,
     extra_headers: dict | None,
-    on_line: Callable[[str], None],
-) -> None:
-    """发送 POST 请求并以 SSE 方式逐行读取响应。"""
+) -> AsyncIterator[str]:
+    """发送 POST 请求并以 SSE 方式逐行产出响应 (异步生成器)。"""
     path_sig = _sig_path(full_url)
     body = encode(json.dumps(json_body, separators=(",", ":")).encode("utf-8"))
     date = str(int(time.time()))
@@ -563,22 +564,22 @@ def open_stream_lines(
         headers.update(extra_headers)
 
     timeout = httpx.Timeout(connect=15, read=300, write=15, pool=15)
-    with httpx.Client(timeout=timeout) as client:
-        with client.stream(
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
             "POST", full_url, content=body.encode("utf-8"), headers=headers
         ) as resp:
             if resp.status_code != 200:
-                err_body = resp.read().decode("utf-8")[:300]
+                err_body = (await resp.aread()).decode("utf-8")[:300]
                 if resp.status_code in (401, 403):
                     raise QoderAuthError(resp.status_code, err_body)
                 raise RuntimeError(f"HTTP {resp.status_code} {err_body}")
 
-            for line in resp.iter_lines():
+            async for line in resp.aiter_lines():
                 if line:
                     is_auth_err, detail = _detect_in_stream_auth_error(line)
                     if is_auth_err:
                         raise QoderAuthError(401, detail)
-                    on_line(line)
+                    yield line
 
     print("[stream] read complete")
 

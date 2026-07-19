@@ -1,4 +1,4 @@
-import copy
+import asyncio
 import json
 import unittest
 from unittest.mock import patch
@@ -6,6 +6,7 @@ from unittest.mock import patch
 import models
 import transform
 import openai_bridge
+from fastapi.testclient import TestClient
 
 
 class PureOpenAiBridgeTests(unittest.TestCase):
@@ -124,9 +125,9 @@ class PureOpenAiBridgeTests(unittest.TestCase):
         self.assertIn(" world", result[-1])
 
     def test_models_route_returns_all_models(self):
-        app = openai_bridge.create_app()
-        resp = app.test_client().get("/v1/models")
-        data = resp.get_json()["data"]
+        client = TestClient(openai_bridge.create_app())
+        resp = client.get("/v1/models")
+        data = resp.json()["data"]
         model_ids = {m["id"] for m in data}
         self.assertIn("Qwen3.7-Max", model_ids)
         self.assertIn("Qwen3.7-Plus", model_ids)
@@ -136,27 +137,27 @@ class PureOpenAiBridgeTests(unittest.TestCase):
             def __init__(self, pat, region=None):
                 self.pat = pat
 
-            def handle_chat(self, req_body):
+            async def handle_chat(self, req_body):
                 models.resolve_model(req_body.get("model"))
                 return {"ok": True}
 
         with patch.object(openai_bridge, "OpenAiBridge", DummyBridge):
-            app = openai_bridge.create_app()
-            resp = app.test_client().post(
+            client = TestClient(openai_bridge.create_app())
+            resp = client.post(
                 "/v1/chat/completions",
                 json={"model": "unknown-model", "messages": []},
                 headers={"Authorization": "Bearer test-pat"},
             )
         self.assertEqual(resp.status_code, 400)
-        self.assertEqual(resp.get_json()["error"]["type"], "invalid_request_error")
+        self.assertEqual(resp.json()["error"]["type"], "invalid_request_error")
 
     def test_chat_route_returns_401_without_bearer_token(self):
-        app = openai_bridge.create_app()
-        resp = app.test_client().post(
+        client = TestClient(openai_bridge.create_app())
+        resp = client.post(
             "/v1/chat/completions", json={"model": "Qwen3.7-Max", "messages": []}
         )
         self.assertEqual(resp.status_code, 401)
-        self.assertEqual(resp.get_json()["error"]["type"], "invalid_request_error")
+        self.assertEqual(resp.json()["error"]["type"], "invalid_request_error")
 
     def test_extract_message_images_and_build_user_message(self):
         data_url = "data:image/png;base64,iVBORw0KGgo="
@@ -202,6 +203,8 @@ class PureOpenAiBridgeTests(unittest.TestCase):
         out = transform._convert_incoming_message(
             msg, tools_enabled=False, allow_structured_tool_calls=False
         )
+        if out is None:
+            self.fail("_convert_incoming_message returned None")
         self.assertEqual(out["role"], "user")
         self.assertEqual(out["contents"][0]["type"], "image_url")
         self.assertEqual(out["contents"][-1]["text"], "describe")
@@ -234,7 +237,7 @@ class PureOpenAiBridgeTests(unittest.TestCase):
             def get_catalog(self):
                 return models.default_catalog()
 
-            def handle_chat(self, req_body):
+            async def handle_chat(self, req_body):
                 # mirror real guard: images + non-vision model → ValueError
                 catalog = self.get_catalog()
                 messages = req_body.get("messages", [])
@@ -251,8 +254,8 @@ class PureOpenAiBridgeTests(unittest.TestCase):
                 return {"ok": True}
 
         with patch.object(openai_bridge, "OpenAiBridge", DummyBridge):
-            app = openai_bridge.create_app()
-            resp = app.test_client().post(
+            client = TestClient(openai_bridge.create_app())
+            resp = client.post(
                 "/v1/chat/completions",
                 json={
                     "model": "MiniMax-M2.7",
@@ -272,34 +275,15 @@ class PureOpenAiBridgeTests(unittest.TestCase):
                 headers={"Authorization": "Bearer test-pat"},
             )
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("not supported", resp.get_json()["error"]["message"])
+        self.assertIn("not supported", resp.json()["error"]["message"])
 
     def test_stream_error_emits_error_chunk_before_done(self):
         """reader 线程异常时应该先发一个 finish_reason='error' 的 chunk,再发 [DONE]。
 
         避免 OpenAI 兼容客户端把截断的流误当成正常结束。"""
-
-        class ErroringBridge(openai_bridge.OpenAiBridge):
-            def __init__(self, pat, region=None):
-                # 绕过真实的 PAT→jobToken 交换,手工填上流式路径需要的最小字段。
-                self._pat = pat
-                self.region = region or openai_bridge.qoder_auth.CN
-                self.identity = transform_identity_stub()
-                self.template_base = _minimal_template_stub()
-                # get_catalog 需要的目录缓存字段
-                self._catalog = None
-                self._catalog_ts = 0.0
-                self._catalog_lock = openai_bridge.threading.Lock()
-
-            def ensure_fresh_session(self):
-                return
-
-            def _open_stream_with_retry(self, url, body, extra_headers, on_line):
-                raise RuntimeError("boom")
-
-        with patch.object(openai_bridge, "OpenAiBridge", ErroringBridge):
-            app = openai_bridge.create_app()
-            resp = app.test_client().post(
+        with patch.object(openai_bridge, "OpenAiBridge", _ErroringBridge):
+            client = TestClient(openai_bridge.create_app())
+            resp = client.post(
                 "/v1/chat/completions",
                 json={
                     "model": "Qwen3.7-Max",
@@ -309,7 +293,7 @@ class PureOpenAiBridgeTests(unittest.TestCase):
                 headers={"Authorization": "Bearer test-pat"},
             )
         self.assertEqual(resp.status_code, 200)
-        body = resp.get_data(as_text=True)
+        body = resp.text
         # 错误 chunk 必须出现在 [DONE] 之前
         done_idx = body.find("data: [DONE]")
         self.assertGreater(done_idx, -1, "missing [DONE] sentinel")
@@ -317,6 +301,136 @@ class PureOpenAiBridgeTests(unittest.TestCase):
         self.assertIn('"finish_reason": "error"', prefix)
         self.assertIn('"error"', prefix)
         self.assertIn("boom", prefix)
+
+    # ── 回归测试: review 修复 (#1/#3/#4/#5) ───────────────────────────
+
+    async def _drain(self, gen):
+        """把异步生成器的产出收集成 list (供 _open_stream_async 测试)。"""
+        out = []
+        async for x in gen:
+            out.append(x)
+        return out
+
+    async def _run_concurrent(self, *aws):
+        """并发等待多个 awaitable (gather 必须在事件循环内调用)。"""
+        await asyncio.gather(*aws)
+
+    def test_refresh_lock_is_asyncio_lock(self):
+        """#1: 续期锁必须是 asyncio.Lock —— threading.Lock 跨 await 会
+        阻塞整个事件循环 (其他 PAT 的请求也会被冻结)。"""
+        bridge = openai_bridge.OpenAiBridge("pt-x")
+        self.assertIsInstance(bridge._refresh_lock, asyncio.Lock)
+
+    def test_bootstrap_session_is_deduplicated_under_concurrency(self):
+        """#3: 同一 Bridge 并发首请求只做一次冷交换 (asyncio.Lock + 双重检查)。"""
+        bridge = openai_bridge.OpenAiBridge("pt-x")
+        jt = {
+            "name": "u",
+            "id": "1",
+            "userType": "personal_standard",
+            "securityOauthToken": "s",
+            "refreshToken": "r",
+            "expireTime": 9999999999999,
+        }
+        exchanges = {"n": 0}
+
+        async def fake_exchange(*a, **k):
+            exchanges["n"] += 1
+            await asyncio.sleep(0.01)  # 放大竞态窗口
+            return jt
+
+        with patch.object(
+            openai_bridge.qoder_auth, "exchange_job_token", fake_exchange
+        ):
+            asyncio.run(
+                self._run_concurrent(
+                    bridge.ensure_fresh_session(),
+                    bridge.ensure_fresh_session(),
+                    bridge.ensure_fresh_session(),
+                )
+            )
+        self.assertEqual(exchanges["n"], 1)
+        self.assertTrue(bridge._bootstrapped)
+        self.assertIsNotNone(bridge.sess)
+
+    def test_open_stream_no_retry_after_content_produced(self):
+        """#4: 已产出内容行后遇到 401, 不再重试 (否则上游重发 prompt 导致重复),
+        直接抛错让 _handle_stream 走错误分支。"""
+        bridge = openai_bridge.OpenAiBridge("pt-x")
+        bridge.sess = object()  # type: ignore[assignment]  # open_stream_lines 被 mock, sess 值无关
+        refreshed = {"n": 0}
+
+        async def fake_refresh():
+            refreshed["n"] += 1
+
+        bridge._force_refresh = fake_refresh
+        call = {"n": 0}
+
+        async def fake_stream(*a, **k):
+            call["n"] += 1
+            yield "data:real-content"  # 先产出一行真实内容
+            raise openai_bridge.qoder_auth.QoderAuthError(401, "mid-stream")
+
+        with (
+            patch.object(openai_bridge.qoder_auth, "open_stream_lines", fake_stream),
+            self.assertRaises(openai_bridge.qoder_auth.QoderAuthError),
+        ):
+            asyncio.run(self._drain(bridge._open_stream_async("u", {}, None)))
+        self.assertEqual(call["n"], 1)  # 上游只调用一次, 没重试
+        self.assertEqual(refreshed["n"], 0)  # 没刷新
+
+    def test_open_stream_retries_when_no_content_yet(self):
+        """#4 反向: 尚未产出任何内容时遇到 401, 刷新并重试一次后成功。"""
+        bridge = openai_bridge.OpenAiBridge("pt-x")
+        bridge.sess = object()  # type: ignore[assignment]
+        refreshed = {"n": 0}
+
+        async def fake_refresh():
+            refreshed["n"] += 1
+
+        bridge._force_refresh = fake_refresh
+        call = {"n": 0}
+
+        async def fake_stream(*a, **k):
+            call["n"] += 1
+            if call["n"] == 1:
+                raise openai_bridge.qoder_auth.QoderAuthError(401, "early")
+            yield "data:after-refresh"
+
+        with patch.object(openai_bridge.qoder_auth, "open_stream_lines", fake_stream):
+            out = asyncio.run(self._drain(bridge._open_stream_async("u", {}, None)))
+        self.assertEqual(call["n"], 2)  # 重试了一次
+        self.assertEqual(refreshed["n"], 1)  # 刷新了一次
+        self.assertEqual(out, ["data:after-refresh"])
+
+    def test_registry_enforces_hard_cap(self):
+        """#5: 注册表条目数任何时候都不超过硬上限。"""
+        openai_bridge._BRIDGE_MAX_ENTRIES = 3
+        try:
+            reg = openai_bridge.BridgeRegistry()
+            region = openai_bridge.qoder_auth.CN
+            for i in range(6):
+                reg.get_or_create(f"pt-{i}", region)
+            self.assertEqual(len(reg._bridges), 3)
+        finally:
+            openai_bridge._BRIDGE_MAX_ENTRIES = 1024
+
+    def test_registry_evicts_idle_entries(self):
+        """#5: 空闲超过 TTL 的条目在惰性 sweep 时被清除。"""
+        openai_bridge._BRIDGE_TTL_SEC = 0.1
+        openai_bridge._BRIDGE_SWEEP_EVERY = 1
+        try:
+            reg = openai_bridge.BridgeRegistry()
+            region = openai_bridge.qoder_auth.CN
+            reg.get_or_create("pt-a", region)
+            # 把访问时间调到 TTL 之前 (避免真实 sleep, 测试更快且不依赖墙钟)
+            for e in reg._bridges.values():
+                e.last_access -= 1.0
+            reg.get_or_create("pt-b", region)  # 新建触发 sweep
+            self.assertEqual(len(reg._bridges), 1)  # pt-a 已过期被清, 只剩 pt-b
+        finally:
+            openai_bridge._BRIDGE_TTL_SEC = 30 * 60
+            openai_bridge._BRIDGE_SWEEP_EVERY = 64
 
 
 def transform_identity_stub():
@@ -348,6 +462,34 @@ def _minimal_template_stub():
         "business": {"id": "", "begin_at": 0, "name": ""},
         "messages": [],
     }
+
+
+class _ErroringBridge(openai_bridge.OpenAiBridge):
+    """流式 reader 抛错的 Bridge 替身 (绕过真实 PAT→jobToken 交换)。
+
+    提到模块级以避免在测试方法内嵌套含 yield 的生成器 (会误触
+    no-return-value-in-generator 规则)。
+    """
+
+    def __init__(self, pat, region=None):
+        self._pat = pat
+        self.region = region or openai_bridge.qoder_auth.CN
+        self.identity = transform_identity_stub()
+        self.template_base = _minimal_template_stub()
+        self._catalog = None
+        self._catalog_ts = 0.0
+        self._catalog_lock = openai_bridge.threading.Lock()
+        self._bootstrapped = True
+
+    async def ensure_fresh_session(self):
+        return
+
+    async def get_catalog(self):
+        return models.default_catalog()
+
+    async def _open_stream_async(self, url, body, extra_headers):
+        raise RuntimeError("boom")
+        yield  # 使其成为异步生成器
 
 
 if __name__ == "__main__":
