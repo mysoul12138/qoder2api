@@ -5,8 +5,11 @@
 
 领取策略（需求：只要"当天还没领取"，就要自动补领）：
   - 服务启动后立即检查一次（补领）
-  - 未领取 / 失败 → 每 retry_minutes 重试一次（默认 30 分钟）
-  - 领取成功 → 当天不再重复，等下一个刷新窗口（每日 10:00 UTC+8 刷新，10:05 之后再试）
+  - 领到了 / 今天已领过 → 当天收工，睡到下一个刷新窗口
+  - 活动未开放 → 刷新窗口前等到窗口；窗口后宽限到 12:00，每 retry_minutes 再试；
+    过了宽限 → 当天放弃，睡到明天窗口（避免整天做无意义轮询）
+  - 网络 / 协议类故障 → 每 retry_minutes 重试（不放弃：恢复后立即补领，避免漏掉当天）
+  - 活动每日 10:00 (UTC+8) 刷新；窗口取 10:15，留 15 分钟缓冲
 
 领取机制（移植自 cli2api 的 worker/src/checkin.mjs，2026-09-20 已实测 token 链路）：
   1. GET  /sash/api/v1/me/campaigns             列出当前账号的活动
@@ -52,12 +55,15 @@ _REQUEST_HEADERS: dict[str, str] = {
     "Referer": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
 }
 
-# 活动每日 10:00 (UTC+8) 刷新；缓冲 5 分钟避开整点抖动
+# 活动每日 10:00 (UTC+8) 刷新；窗口留 15 分钟缓冲，避开整点抖动与刷新延迟
 CST = timezone(timedelta(hours=8))
 REFRESH_HOUR = 10
-REFRESH_MINUTE = 5
+REFRESH_MINUTE = 15
 
-DEFAULT_RETRY_SECONDS = 30 * 60   # 未领取时的默认重试间隔
+# "活动未开放"的宽限：窗口之后到 12:00 仍未开放 → 当天放弃，睡到明天窗口
+GRACE_HOUR = 12
+
+DEFAULT_RETRY_SECONDS = 30 * 60   # 未落定时的默认重试间隔
 MIN_RETRY_SECONDS = 5 * 60        # 重试间隔下限（防误配置成高频请求）
 HTTP_TIMEOUT_SECONDS = 20.0
 
@@ -74,8 +80,8 @@ class CheckinOutcome:
     status 取值:
       success: 本次成功领取（message 含积分信息）
       already: 今日已领取（含"复查确认"恢复路径）
-      skipped: 活动未开放 / 无可领取项（稍后重试）
-      error:   网络或协议异常（稍后重试）
+      skipped: 活动未开放 / 无可领取项
+      error:   网络或协议异常（可自愈，恢复后立即补领）
     """
 
     status: str
@@ -135,23 +141,44 @@ def reward_of(campaign: dict) -> int | None:
     return int(amount)
 
 
+def _window_deadline(local: datetime) -> datetime:
+    """当天的刷新窗口时刻（入参需已换算为 CST 时区）。"""
+    return local.replace(hour=REFRESH_HOUR, minute=REFRESH_MINUTE, second=0, microsecond=0)
+
+
+def _grace_deadline(local: datetime) -> datetime:
+    """当天"活动未开放"的宽限截止时刻。"""
+    return local.replace(hour=GRACE_HOUR, minute=0, second=0, microsecond=0)
+
+
 def seconds_until_next_window(now: datetime) -> float:
-    """距下一个刷新窗口（每日 10:05 UTC+8）的秒数。"""
+    """距下一个刷新窗口（每日 10:15 UTC+8）的秒数。"""
     local = now.astimezone(CST)
-    target = local.replace(hour=REFRESH_HOUR, minute=REFRESH_MINUTE, second=0, microsecond=0)
+    target = _window_deadline(local)
     if target <= local:
         target += timedelta(days=1)
     return (target - local).total_seconds()
 
 
-def next_wait_seconds(outcomes: list["CheckinOutcome"], now: datetime, retry_seconds: int) -> float:
-    """根据本轮结果决定下次检查的等待时长。
+def next_check_plan(outcomes: list["CheckinOutcome"], now: datetime, retry_seconds: int) -> tuple[float, str]:
+    """根据本轮结果决定 (下次检查等待秒数, 调度类型)。
 
-    全部落定（已领取）→ 睡到下一个刷新窗口；否则 → 按重试间隔再来。
+    调度类型:
+      settled  - 领到/已领：睡到下一个刷新窗口
+      pre_open - 活动还没开放且未到窗口：直接等到窗口（不空转）
+      retrying - 未开放但仍在宽限期内 / 可自愈故障：按间隔重试
+      give_up  - 未开放且过了宽限：当天放弃，睡到明天窗口
     """
     if outcomes and all(o.status in _SETTLED_STATUSES for o in outcomes):
-        return seconds_until_next_window(now)
-    return float(retry_seconds)
+        return seconds_until_next_window(now), "settled"
+    if outcomes and all(o.status == "skipped" for o in outcomes):
+        local = now.astimezone(CST)
+        if local < _window_deadline(local):
+            return (_window_deadline(local) - local).total_seconds(), "pre_open"
+        if local < _grace_deadline(local):
+            return float(retry_seconds), "retrying"
+        return seconds_until_next_window(now), "give_up"
+    return float(retry_seconds), "retrying"
 
 
 def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSettings | None:
@@ -219,7 +246,7 @@ class DailyCreditCheckin:
         self._now = now or (lambda: datetime.now(timezone.utc))
 
     async def run(self) -> None:
-        """主循环：启动即补领；未领取按 retry 间隔重试；领取成功后睡到下一个刷新窗口。"""
+        """主循环：启动即补领，之后按 next_check_plan 决定下一次检查时间。"""
         while True:
             outcomes: list[CheckinOutcome] = []
             for pat in self._settings.pats:
@@ -233,12 +260,16 @@ class DailyCreditCheckin:
                 print(f"[checkin] {label}: {outcome.message or outcome.status}")
                 outcomes.append(outcome)
 
-            settled = bool(outcomes) and all(o.status in _SETTLED_STATUSES for o in outcomes)
-            wait = next_wait_seconds(outcomes, self._now(), self._settings.retry_seconds)
-            if settled:
-                print(f"[checkin] 今日已处理完，{int(wait // 60)} 分钟后（下一窗口）再检查")
+            wait, kind = next_check_plan(outcomes, self._now(), self._settings.retry_seconds)
+            minutes = max(1, int(round(wait / 60)))
+            if kind == "settled":
+                print(f"[checkin] 今日已处理完，{minutes} 分钟后（下一窗口）再检查")
+            elif kind == "pre_open":
+                print(f"[checkin] 活动尚未开放，{minutes} 分钟后（刷新窗口）再检查")
+            elif kind == "give_up":
+                print(f"[checkin] 活动今日未开放，{minutes} 分钟后（明天窗口）再看")
             else:
-                print(f"[checkin] {int(wait // 60)} 分钟后重试")
+                print(f"[checkin] {minutes} 分钟后重试")
             await asyncio.sleep(wait)
 
     async def _claim_once(self, pat: str) -> tuple[str, CheckinOutcome]:
@@ -377,7 +408,7 @@ def start_background_task(bridge_factory, *, env=None, project_dir: str | None =
     service = DailyCreditCheckin(settings, bridge_factory)
     print(
         f"[checkin] 已启用: {len(settings.pats)} 个账号, "
-        f"未领取时每 {settings.retry_seconds // 60} 分钟重试, "
+        f"未落定时每 {settings.retry_seconds // 60} 分钟重试, "
         f"刷新窗口 每日 {REFRESH_HOUR}:{REFRESH_MINUTE:02d} (UTC+8)"
     )
     return asyncio.create_task(service.run(), name="qoder-daily-checkin")

@@ -247,27 +247,54 @@ class CheckinSchedulingTests(unittest.TestCase):
         def cst(y, m, d, hh, mm):
             return datetime(y, m, d, hh, mm, tzinfo=CST)
 
-        # 09:00 → 当日 10:05 = 65 分钟
-        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 9, 0)), 65 * 60)
-        # 10:04 → 1 分钟
-        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 10, 4)), 60)
-        # 10:05 整 → 次日（一整天）
-        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 10, 5)), 86400)
-        # 23:00 → 次日 10:05 = 11 小时 5 分
-        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 23, 0)), (11 * 60 + 5) * 60)
+        # 09:00 → 当日 10:15 = 75 分钟
+        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 9, 0)), 75 * 60)
+        # 10:14 → 1 分钟
+        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 10, 14)), 60)
+        # 10:15 整 → 次日（一整天）
+        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 10, 15)), 86400)
+        # 23:00 → 次日 10:15 = 11 小时 15 分
+        self.assertEqual(checkin.seconds_until_next_window(cst(2026, 9, 21, 23, 0)), (11 * 60 + 15) * 60)
         # UTC 输入等价（01:00 UTC = 09:00 CST）
         self.assertEqual(
             checkin.seconds_until_next_window(datetime(2026, 9, 21, 1, 0, tzinfo=timezone.utc)),
-            65 * 60,
+            75 * 60,
         )
 
-    def test_next_wait_seconds(self):
+    def test_plan_settled_waits_for_next_window(self):
         now = datetime(2026, 9, 21, 9, 0, tzinfo=CST)
         settled = [checkin.CheckinOutcome("success"), checkin.CheckinOutcome("already")]
-        self.assertEqual(checkin.next_wait_seconds(settled, now, 1800), 65 * 60)
+        self.assertEqual(checkin.next_check_plan(settled, now, 1800), (75 * 60, "settled"))
+
+    def test_plan_open_before_window_waits_for_window(self):
+        # 刷新前"活动未开放" → 直接等到窗口，不空转
+        early = datetime(2026, 9, 21, 9, 0, tzinfo=CST)
+        skipped = [checkin.CheckinOutcome("skipped")]
+        self.assertEqual(checkin.next_check_plan(skipped, early, 1800), (75 * 60, "pre_open"))
+
+    def test_plan_open_in_grace_retries(self):
+        # 窗口后、12:00 宽限内仍没开放 → 按间隔重试
+        in_grace = datetime(2026, 9, 21, 11, 30, tzinfo=CST)
+        skipped = [checkin.CheckinOutcome("skipped")]
+        self.assertEqual(checkin.next_check_plan(skipped, in_grace, 1800), (1800, "retrying"))
+
+    def test_plan_open_after_grace_gives_up_until_tomorrow(self):
+        # 过了 12:00 宽限仍没开放 → 当天放弃，睡到明天窗口
+        skipped = [checkin.CheckinOutcome("skipped")]
+        at_grace = datetime(2026, 9, 21, 12, 0, tzinfo=CST)
+        self.assertEqual(checkin.next_check_plan(skipped, at_grace, 1800), (22 * 60 * 60 + 15 * 60, "give_up"))
+        late_night = datetime(2026, 9, 21, 23, 0, tzinfo=CST)
+        self.assertEqual(checkin.next_check_plan(skipped, late_night, 1800), ((11 * 60 + 15) * 60, "give_up"))
+
+    def test_plan_errors_keep_retrying(self):
+        # 网络/协议类故障不放弃（恢复后立即补领当天）
+        late_night = datetime(2026, 9, 21, 23, 0, tzinfo=CST)
+        errors = [checkin.CheckinOutcome("error")]
+        self.assertEqual(checkin.next_check_plan(errors, late_night, 1800), (1800, "retrying"))
         mixed = [checkin.CheckinOutcome("success"), checkin.CheckinOutcome("error")]
-        self.assertEqual(checkin.next_wait_seconds(mixed, now, 1800), 1800)
-        self.assertEqual(checkin.next_wait_seconds([], now, 1800), 1800)
+        early = datetime(2026, 9, 21, 9, 0, tzinfo=CST)
+        self.assertEqual(checkin.next_check_plan(mixed, early, 1800), (1800, "retrying"))
+        self.assertEqual(checkin.next_check_plan([], late_night, 1800), (1800, "retrying"))
 
 
 # ── 配置解析 ────────────────────────────────────────────────────────────
