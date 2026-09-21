@@ -7,6 +7,7 @@
 
 import asyncio
 import json
+import re
 import unittest
 from unittest.mock import patch
 
@@ -285,6 +286,38 @@ class NestedBusyEnvelopeTests(unittest.TestCase):
         is_busy, _, retry_after = qoder_auth.detect_upstream_busy(deep)
         self.assertFalse(is_busy)
         self.assertIsNone(retry_after)
+
+
+class BusyMessageTextTests(unittest.TestCase):
+    """忙错误的消息文本刻意不含可被解析的"重试时间"短语。
+
+    桌面端(Hermes)会把错误里解析出的任何重试时间渲染成"限额将于 X 重置"的
+    倒计时（把排队误当成额度重置），所以消息里不写 "(retry after Ns)" ——
+    这里用 Hermes 的同款正则做防回归（hermes agent/retry_utils.py）。
+    """
+
+    # 与 Hermes agent/retry_utils.py::_RETRY_AFTER_SECONDS_RE 同款
+    _RETRY_PHRASE_RE = re.compile(
+        r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
+        re.IGNORECASE,
+    )
+
+    def test_message_has_no_parseable_retry_phrase(self):
+        err = qoder_auth.QoderBusyError("10605 queued", 30)
+        self.assertIsNone(self._RETRY_PHRASE_RE.search(str(err)))
+
+    def test_real_busy_detail_text_does_not_parse(self):
+        # 真实忙信号解出的详情里带 "retryAfterSeconds": 30 —— 它同样不能被匹配到
+        is_busy, detail, retry_after = qoder_auth.detect_upstream_busy(NESTED_BUSY_ENVELOPE)
+        self.assertTrue(is_busy)
+        msg = str(qoder_auth.QoderBusyError(detail, retry_after))
+        self.assertIsNone(self._RETRY_PHRASE_RE.search(msg))
+
+    def test_retry_seconds_still_ride_on_the_attribute(self):
+        # 头部映射依赖这个属性（非流式 503 的 Retry-After），不能被一起删掉
+        err = qoder_auth.QoderBusyError("10605 queued", 30)
+        self.assertEqual(err.retry_after_seconds, 30)
+        self.assertIn("10605", str(err))
 
 
 class _NestedBusyRouteBridge(openai_bridge.OpenAiBridge):

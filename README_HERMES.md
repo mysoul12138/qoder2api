@@ -100,6 +100,7 @@ custom_providers:
 - 信封可能嵌套多层（实测 2 层：外层 `code 403` → 内层 `code 10605` → 队列详情）；解析会逐层下钻到含 `retryAfterSeconds` 的详情层，`Retry-After` 才不会漏
 - 非流式：返回 **HTTP 503 + `Retry-After`**（上游给了 `retryAfterSeconds` 时），`error.type = "upstream_busy"`
 - 流式：流内错误 chunk 的 `error.type = "upstream_busy"`，客户端可据此退避重试
+- 错误消息里**故意不写** `(retry after Ns)` 字样：桌面端(Hermes)会把消息里解析出的任何重试时间渲染成"限额将于 X 重置"倒计时（把排队误当额度重置）；重试建议只走 `Retry-After` 头与消息 JSON 里的 `retryAfterSeconds`
 - 真正的登录过期（`code 105` / 401 / 403 无忙标记）仍照旧刷新会话重试一次
 
 实现：`qoder_auth.QoderBusyError` + `detect_upstream_busy()`（分类 + 多层信封下钻），桥接层负责状态码映射。

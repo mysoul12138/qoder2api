@@ -302,8 +302,10 @@ class QoderBusyError(RuntimeError):
 
     def __init__(self, detail: str = "", retry_after_seconds: int | None = None):
         message = f"upstream busy: {detail}" if detail else "upstream busy"
-        if retry_after_seconds is not None:
-            message = f"{message} (retry after {retry_after_seconds}s)"
+        # 故意不在消息里附 "(retry after Ns)": 桌面端(Hermes)会把消息里能解析出的
+        # 任何"重试时间"渲染成"限额将于 X 重置"的倒计时（把排队误当成额度重置）。
+        # 重试建议仍由 retry_after_seconds 承载（非流式 503 的 Retry-After 头），
+        # 队列详情里的 retryAfterSeconds 也原样保留在消息 JSON 里。
         super().__init__(message)
         self.detail = detail
         self.retry_after_seconds = retry_after_seconds
