@@ -619,6 +619,10 @@ async def open_stream_lines(
 #     \"{\\\"isQueued\\\":false,\\\"retryAfterSeconds\\\":5,...}\"}"}
 _BUSY_CODES = frozenset({"10605"})
 _BUSY_MARKERS = ("isQueued", "serviceAvailable", "retryAfterSeconds", "waitTime", "queueType")
+# 信封最多下钻几层。实测有双层形态（外层 code "403" → 内层 code "10605" → 队列详情,
+# retryAfterSeconds 在第二层的 message 里）；上限给到 6 留余量，同时防止异常的超深
+# 嵌套拖垮解析。
+_BUSY_DRILL_LIMIT = 6
 
 
 def _busy_body_of(obj: dict) -> dict | None:
@@ -631,21 +635,42 @@ def _busy_body_of(obj: dict) -> dict | None:
     return None
 
 
-def _busy_payload_of(body: dict) -> dict | None:
-    """body 若是忙/排队信号，返回其元数据（可能藏在 message 的 JSON 字符串里）。"""
-    payload = body.get("message")
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except (json.JSONDecodeError, ValueError):
-            payload = None
-    if isinstance(payload, dict):
-        return payload
+def _json_object_or_none(raw) -> dict | None:
+    """字符串能按 JSON 解析成对象就返回它，否则 None。"""
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _busy_payload_of(body: dict) -> tuple[dict | None, str]:
+    """逐层下钻信封，返回 (含忙标记的元数据层, 该层对应的业务 code)。
+
+    旧实现只挖一层 message: 遇到"外层 403 套内层 10605"的双层信封时,
+    拿到的只是内层信封本身, retryAfterSeconds 还埋在它的 message 里 ——
+    结果 503 丢掉了 Retry-After。这里按 message 逐层下钻（有层数上限）,
+    停在第一个带 _BUSY_MARKERS 的层; code 取沿途最深的那个业务码。
+    """
+    current = body
+    code = str(body.get("code") or "")
+    for _ in range(_BUSY_DRILL_LIMIT):
+        payload = _json_object_or_none(current.get("message"))
+        if payload is None:
+            break
+        if payload.get("code") not in (None, ""):
+            code = str(payload["code"])  # 越深越贴近业务层
+        if any(key in payload for key in _BUSY_MARKERS):
+            return payload, code
+        current = payload  # 这一层仍是纯信封, 继续下钻
+    # 兜底: 没有 message 可挖时, body 本身可能就是元数据层（或至少带忙业务码）。
     if any(key in body for key in _BUSY_MARKERS):
-        return body
+        return body, code
     if str(body.get("code") or "") in _BUSY_CODES:
-        return {}
-    return None
+        return {}, code
+    return None, code
 
 
 def detect_upstream_busy(obj: dict) -> tuple[bool, str, int | None]:
@@ -655,11 +680,10 @@ def detect_upstream_busy(obj: dict) -> tuple[bool, str, int | None]:
     body = _busy_body_of(obj)
     if body is None:
         return False, "", None
-    payload = _busy_payload_of(body)
+    payload, code = _busy_payload_of(body)
     if payload is None:
         return False, "", None
 
-    code = str(body.get("code") or "")
     detail = " ".join(
         part
         for part in (code, json.dumps(payload, ensure_ascii=False) if payload else "")

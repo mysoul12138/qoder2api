@@ -44,6 +44,56 @@ AUTH_ENVELOPE = {
     "statusCode": "FORBIDDEN",
 }
 
+# 实测(2026-09-21)的"双层信封"形态: 外层 code 403 的 message 里再套一层 code 10605
+# 的信封, 队列详情（含 retryAfterSeconds）埋在第二层的 message 里。只挖一层的旧实现
+# 解析不到 retryAfterSeconds, 503 就丢掉了 Retry-After。
+NESTED_BUSY_ENVELOPE = {
+    "headers": {"Content-Type": ["application/json"]},
+    "body": json.dumps(
+        {
+            "code": "403",
+            "message": json.dumps(
+                {
+                    "code": "10605",
+                    "message": json.dumps(
+                        {
+                            "isQueued": True,
+                            "modelKey": "qfmodel",
+                            "queueCount": 8079,
+                            "queueType": "p3",
+                            "retryAfterSeconds": 30,
+                            "serviceAvailable": True,
+                            "waitTime": 393,
+                        }
+                    ),
+                }
+            ),
+        }
+    ),
+    "statusCodeValue": 403,
+    "statusCode": "FORBIDDEN",
+}
+
+BARE_NESTED_BUSY = {
+    "code": "403",
+    "message": json.dumps(
+        {
+            "code": "10605",
+            "message": json.dumps(
+                {
+                    "isQueued": True,
+                    "modelKey": "qfmodel",
+                    "queueCount": 8079,
+                    "queueType": "p3",
+                    "retryAfterSeconds": 30,
+                    "serviceAvailable": True,
+                    "waitTime": 393,
+                }
+            ),
+        }
+    ),
+}
+
 
 def _line(obj) -> str:
     return "data:" + json.dumps(obj, ensure_ascii=False)
@@ -203,6 +253,64 @@ class BusyStreamChunkTests(unittest.TestCase):
         self.assertEqual(err_lines[0]["error"]["type"], "upstream_busy")
         self.assertEqual(err_lines[0]["choices"][0]["finish_reason"], "error")
         self.assertIn("data: [DONE]", body)
+
+
+class NestedBusyEnvelopeTests(unittest.TestCase):
+    """双层信封（外层 403 套内层 10605）必须下钻到队列详情层。"""
+
+    def test_nested_envelope_drills_to_retry_after(self):
+        is_busy, detail, retry_after = qoder_auth.detect_upstream_busy(NESTED_BUSY_ENVELOPE)
+        self.assertTrue(is_busy)
+        self.assertEqual(retry_after, 30, "retryAfterSeconds 在第二层 message 里, 必须挖到")
+        self.assertIn("10605", detail)
+        self.assertIn("queueCount", detail)
+
+    def test_nested_bare_body_drills_to_retry_after(self):
+        is_busy, _, retry_after = qoder_auth.detect_upstream_busy(BARE_NESTED_BUSY)
+        self.assertTrue(is_busy)
+        self.assertEqual(retry_after, 30)
+
+    def test_nested_busy_line_detected_in_stream(self):
+        self.assertTrue(qoder_auth._detect_busy_line(_line(NESTED_BUSY_ENVELOPE))[0])
+
+    def test_nested_envelope_is_not_auth(self):
+        is_auth, _ = qoder_auth._detect_in_stream_auth_error(_line(NESTED_BUSY_ENVELOPE))
+        self.assertFalse(is_auth, "双层信封的忙信号同样不该被判成鉴权失败")
+
+    def test_depth_limit_fails_safe(self):
+        # 超过下钻上限的异常嵌套: 不抛异常、不硬判成忙（保持未知形态的既有语义）
+        deep = {"isQueued": True, "retryAfterSeconds": 30}
+        for _ in range(qoder_auth._BUSY_DRILL_LIMIT + 2):
+            deep = {"code": "403", "message": json.dumps(deep)}
+        is_busy, _, retry_after = qoder_auth.detect_upstream_busy(deep)
+        self.assertFalse(is_busy)
+        self.assertIsNone(retry_after)
+
+
+class _NestedBusyRouteBridge(openai_bridge.OpenAiBridge):
+    """handle_chat 抛"双层信封"解出的忙错误, 用于验证 Retry-After 头来自最里层。"""
+
+    async def handle_chat(self, req_body):
+        is_busy, detail, retry_after = qoder_auth.detect_upstream_busy(NESTED_BUSY_ENVELOPE)
+        assert is_busy
+        raise qoder_auth.QoderBusyError(detail, retry_after)
+
+
+class NestedBusyRouteTests(unittest.TestCase):
+    def test_route_retry_after_comes_from_nested_envelope(self):
+        with patch.object(openai_bridge, "OpenAiBridge", _NestedBusyRouteBridge):
+            client = TestClient(openai_bridge.create_app())
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "Qwen3.8-Flash",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={"Authorization": "Bearer test-pat"},
+            )
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.headers.get("retry-after"), "30")
+        self.assertEqual(resp.json()["error"]["type"], "upstream_busy")
 
 
 if __name__ == "__main__":

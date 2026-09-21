@@ -97,8 +97,9 @@ custom_providers:
 上游繁忙时会用 `code 10605` 之类的信封（常带 403）告知"忙 / 排队"。这类回应**不是鉴权失败**：
 
 - 不再误判为 401 → 不再白刷新会话（旧行为会轮换 token，连累其他在途请求）
+- 信封可能嵌套多层（实测 2 层：外层 `code 403` → 内层 `code 10605` → 队列详情）；解析会逐层下钻到含 `retryAfterSeconds` 的详情层，`Retry-After` 才不会漏
 - 非流式：返回 **HTTP 503 + `Retry-After`**（上游给了 `retryAfterSeconds` 时），`error.type = "upstream_busy"`
 - 流式：流内错误 chunk 的 `error.type = "upstream_busy"`，客户端可据此退避重试
 - 真正的登录过期（`code 105` / 401 / 403 无忙标记）仍照旧刷新会话重试一次
 
-实现：`qoder_auth.QoderBusyError` + `detect_upstream_busy()`（分类），桥接层负责状态码映射。
+实现：`qoder_auth.QoderBusyError` + `detect_upstream_busy()`（分类 + 多层信封下钻），桥接层负责状态码映射。
