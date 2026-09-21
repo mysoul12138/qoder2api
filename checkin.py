@@ -1,0 +1,383 @@
+"""checkin.py — Qoder 每日 100 Credits 自动领取（签到）后台任务。
+
+集成方式：服务启动时随 FastAPI lifespan 一起拉起（见 openai_bridge.create_app），
+随反代进程生灭，无需单独脚本。
+
+领取策略（需求：只要"当天还没领取"，就要自动补领）：
+  - 服务启动后立即检查一次（补领）
+  - 未领取 / 失败 → 每 retry_minutes 重试一次（默认 30 分钟）
+  - 领取成功 → 当天不再重复，等下一个刷新窗口（每日 10:00 UTC+8 刷新，10:05 之后再试）
+
+领取机制（移植自 cli2api 的 worker/src/checkin.mjs，2026-09-20 已实测 token 链路）：
+  1. GET  /sash/api/v1/me/campaigns             列出当前账号的活动
+  2. 过滤 actionType=CLAIM_BENEFIT 且 claimStatus=CLAIMABLE 的积分类活动
+  3. POST /sash/api/v1/me/campaigns/{id}/claim  领取（空 body）
+  4. 复查列表确认 CLAIMED（防止"领到了但响应异常"被误判为失败）
+
+认证：Bearer {securityOauthToken} —— 复用 bridge 现有 PAT→jobToken 会话体系，
+本模块不直接接触 PAT。请求头与官方桌面端"活动页"一致（缺 Cosy-ClientType
+时上游会把每日活动过滤成未开放）。
+
+配置（不配置 = 功能自动关闭，不影响主链路）：
+  方式一（推荐）项目目录 checkin.json:
+      {"pat": "pt-...", "retry_minutes": 30}
+      多账号: {"pats": ["pt-...", "pt-..."]}
+  方式二 环境变量（优先级高于文件）:
+      QODER_CHECKIN_PAT              逗号分隔多账号
+      QODER_CHECKIN_RETRY_MINUTES    重试间隔（分钟）
+"""
+
+import asyncio
+import json
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
+
+import httpx
+
+
+# ── 常量 ────────────────────────────────────────────────────────────────
+
+CAMPAIGNS_URL = "https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"
+
+# 与官方桌面端活动页保持一致的固定请求头（Cosy-ClientType 缺失时上游会把每日活动过滤为"未开放"）
+_REQUEST_HEADERS: dict[str, str] = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "User-Agent": "Qoder",
+    "Cosy-ClientType": "10",
+    "Cosy-Version": "0.3.4",
+    "Origin": "https://qoder.com.cn",
+    "Referer": "https://openapi.qoder.com.cn/growth-page/activity-iframe",
+}
+
+# 活动每日 10:00 (UTC+8) 刷新；缓冲 5 分钟避开整点抖动
+CST = timezone(timedelta(hours=8))
+REFRESH_HOUR = 10
+REFRESH_MINUTE = 5
+
+DEFAULT_RETRY_SECONDS = 30 * 60   # 未领取时的默认重试间隔
+MIN_RETRY_SECONDS = 5 * 60        # 重试间隔下限（防误配置成高频请求）
+HTTP_TIMEOUT_SECONDS = 20.0
+
+# 已尘埃落定的结果（当天无需再试）
+_SETTLED_STATUSES = frozenset({"success", "already"})
+
+
+# ── 结果与配置 ──────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class CheckinOutcome:
+    """一次签到尝试的结果。
+
+    status 取值:
+      success: 本次成功领取（message 含积分信息）
+      already: 今日已领取（含"复查确认"恢复路径）
+      skipped: 活动未开放 / 无可领取项（稍后重试）
+      error:   网络或协议异常（稍后重试）
+    """
+
+    status: str
+    message: str = ""
+    reward: int | None = None
+
+
+@dataclass(frozen=True)
+class CheckinSettings:
+    pats: tuple[str, ...]
+    retry_seconds: int = DEFAULT_RETRY_SECONDS
+
+
+# ── 纯函数（便于单测）────────────────────────────────────────────────────
+
+def campaigns_from(payload) -> list[dict]:
+    """从活动列表响应中提取 campaigns 数组（兼容多种包裹形态）。"""
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    if "campaigns" in payload:
+        value = payload["campaigns"]
+        if not isinstance(value, list):
+            raise ValueError("campaigns 字段不是数组")
+        return [x for x in value if isinstance(x, dict)]
+    data = payload.get("data")
+    if isinstance(data, dict) and isinstance(data.get("campaigns"), list):
+        return [x for x in data["campaigns"] if isinstance(x, dict)]
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+    return []
+
+
+def credit_campaigns(items: list[dict]) -> list[dict]:
+    """过滤出"可领取积分"类活动（CLAIM_BENEFIT 且有 campaignId）。"""
+    result = []
+    for item in items:
+        if item.get("actionType") != "CLAIM_BENEFIT":
+            continue
+        campaign_id = item.get("campaignId")
+        if isinstance(campaign_id, str) and campaign_id:
+            result.append(item)
+    return result
+
+
+def reward_of(campaign: dict) -> int | None:
+    """读取活动奖励积分数（benefit.kind=CREDITS），非法值返回 None。"""
+    benefit = campaign.get("benefit")
+    if not isinstance(benefit, dict) or benefit.get("kind") != "CREDITS":
+        return None
+    amount = benefit.get("amount")
+    if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+        return None
+    if amount < 0:
+        return None
+    return int(amount)
+
+
+def seconds_until_next_window(now: datetime) -> float:
+    """距下一个刷新窗口（每日 10:05 UTC+8）的秒数。"""
+    local = now.astimezone(CST)
+    target = local.replace(hour=REFRESH_HOUR, minute=REFRESH_MINUTE, second=0, microsecond=0)
+    if target <= local:
+        target += timedelta(days=1)
+    return (target - local).total_seconds()
+
+
+def next_wait_seconds(outcomes: list["CheckinOutcome"], now: datetime, retry_seconds: int) -> float:
+    """根据本轮结果决定下次检查的等待时长。
+
+    全部落定（已领取）→ 睡到下一个刷新窗口；否则 → 按重试间隔再来。
+    """
+    if outcomes and all(o.status in _SETTLED_STATUSES for o in outcomes):
+        return seconds_until_next_window(now)
+    return float(retry_seconds)
+
+
+def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSettings | None:
+    """解析签到配置；未配置 PAT 返回 None（= 功能关闭）。"""
+    env = os.environ if env is None else env
+    project_dir = project_dir or os.path.dirname(os.path.abspath(__file__))
+
+    pats: list[str] = []
+    retry_seconds: int | None = None
+
+    raw_env_pat = (env.get("QODER_CHECKIN_PAT") or "").strip()
+    if raw_env_pat:
+        pats = [p.strip() for p in raw_env_pat.split(",") if p.strip()]
+    else:
+        config_path = os.path.join(project_dir, "checkin.json")
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as fh:
+                    config = json.load(fh)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[checkin] checkin.json 读取失败: {exc!r}")
+                return None
+            if isinstance(config, dict):
+                single = config.get("pat")
+                if isinstance(single, str) and single.strip():
+                    pats = [single.strip()]
+                else:
+                    multiple = config.get("pats")
+                    if isinstance(multiple, list):
+                        pats = [str(p).strip() for p in multiple if str(p).strip()]
+                retry_minutes = config.get("retry_minutes")
+                if (
+                    isinstance(retry_minutes, (int, float))
+                    and not isinstance(retry_minutes, bool)
+                    and retry_minutes > 0
+                ):
+                    retry_seconds = int(retry_minutes * 60)
+
+    raw_env_retry = (env.get("QODER_CHECKIN_RETRY_MINUTES") or "").strip()
+    if raw_env_retry:
+        try:
+            retry_seconds = int(float(raw_env_retry) * 60)
+        except ValueError:
+            print(f"[checkin] QODER_CHECKIN_RETRY_MINUTES 不是数字，忽略: {raw_env_retry!r}")
+
+    if not pats:
+        return None
+    if retry_seconds is None:
+        retry_seconds = DEFAULT_RETRY_SECONDS
+    retry_seconds = max(MIN_RETRY_SECONDS, retry_seconds)
+    return CheckinSettings(pats=tuple(pats), retry_seconds=retry_seconds)
+
+
+# ── 签到服务 ────────────────────────────────────────────────────────────
+
+class DailyCreditCheckin:
+    """进程内签到后台任务（多账号顺序处理）。"""
+
+    def __init__(self, settings: CheckinSettings, bridge_factory, *, client_factory=None, now=None):
+        self._settings = settings
+        self._bridge_factory = bridge_factory
+        self._client_factory = client_factory or (
+            lambda: httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False)
+        )
+        self._now = now or (lambda: datetime.now(timezone.utc))
+
+    async def run(self) -> None:
+        """主循环：启动即补领；未领取按 retry 间隔重试；领取成功后睡到下一个刷新窗口。"""
+        while True:
+            outcomes: list[CheckinOutcome] = []
+            for pat in self._settings.pats:
+                try:
+                    label, outcome = await self._claim_once(pat)
+                except asyncio.CancelledError:
+                    raise  # 服务关闭：正常退出
+                except Exception as exc:  # noqa: BLE001 防御：循环绝不能被意外异常杀死
+                    label = f"pt-...{pat[-4:]}" if len(pat) >= 4 else "pat"
+                    outcome = CheckinOutcome("error", f"未预期异常: {exc!r}")
+                print(f"[checkin] {label}: {outcome.message or outcome.status}")
+                outcomes.append(outcome)
+
+            settled = bool(outcomes) and all(o.status in _SETTLED_STATUSES for o in outcomes)
+            wait = next_wait_seconds(outcomes, self._now(), self._settings.retry_seconds)
+            if settled:
+                print(f"[checkin] 今日已处理完，{int(wait // 60)} 分钟后（下一窗口）再检查")
+            else:
+                print(f"[checkin] {int(wait // 60)} 分钟后重试")
+            await asyncio.sleep(wait)
+
+    async def _claim_once(self, pat: str) -> tuple[str, CheckinOutcome]:
+        """对单个 PAT 执行一次完整签到；返回 (账号标签, 结果)。"""
+        label = f"pt-...{pat[-4:]}" if len(pat) >= 4 else "pat"
+        try:
+            bridge = self._bridge_factory(pat)
+            await bridge.ensure_fresh_session()
+            identity = bridge._current_sess().identity
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return label, CheckinOutcome("error", f"会话准备失败: {exc!r}")
+
+        account = (getattr(identity, "name", "") or "").strip()
+        uid = (getattr(identity, "uid", "") or "").strip()
+        if account or uid:
+            label = account or f"...{uid[-6:]}"
+        token = getattr(identity, "security_oauth_token", "") or ""
+        if not token:
+            return label, CheckinOutcome("error", "会话缺少 securityOauthToken")
+
+        async with self._client_factory() as client:
+            outcome = await self._execute(client, bridge, token)
+        return label, outcome
+
+    async def _execute(self, client: httpx.AsyncClient, bridge, token: str) -> CheckinOutcome:
+        """完整领取流程：列表 → 领取 → 复查确认。"""
+        headers = self._build_headers(token)
+
+        # 1) 列出活动（401 时主动刷新会话后重试一次，对应 checkin.mjs 的 forceRefresh）
+        try:
+            response = await client.get(CAMPAIGNS_URL, headers=headers)
+        except Exception as exc:  # noqa: BLE001
+            return CheckinOutcome("error", f"请求失败: {exc!r}")
+        if response.status_code == 401:
+            try:
+                await bridge._force_refresh()
+                token = bridge._current_sess().identity.security_oauth_token
+            except Exception as exc:  # noqa: BLE001
+                return CheckinOutcome("error", f"凭证刷新失败: {exc!r}")
+            headers = self._build_headers(token)
+            try:
+                response = await client.get(CAMPAIGNS_URL, headers=headers)
+            except Exception as exc:  # noqa: BLE001
+                return CheckinOutcome("error", f"请求失败: {exc!r}")
+        if response.status_code == 404:
+            return CheckinOutcome("skipped", "签到活动未开放")
+        if response.status_code != 200:
+            return CheckinOutcome("error", f"活动列表 HTTP {response.status_code}")
+        try:
+            items = campaigns_from(response.json())
+        except Exception as exc:  # noqa: BLE001
+            return CheckinOutcome("error", f"活动列表解析失败: {exc!r}")
+
+        # 2) 过滤积分类活动
+        benefits = credit_campaigns(items)
+        if not benefits:
+            return CheckinOutcome("skipped", "签到活动未开放")
+        claimable = [c for c in benefits if c.get("claimStatus") == "CLAIMABLE"]
+        if not claimable:
+            if any(c.get("claimStatus") == "CLAIMED" for c in benefits):
+                return CheckinOutcome("already", "今日已签到")
+            return CheckinOutcome("skipped", "签到活动未开放")
+
+        # 3) 逐个领取（失败先复查，防"领到了但响应异常"被误判）
+        confirmed = 0
+        recovered = 0
+        reward = 0
+        has_reward = False
+        for campaign in claimable:
+            campaign_id = str(campaign.get("campaignId"))
+            claim_url = f"{CAMPAIGNS_URL}/{quote(campaign_id, safe='')}/claim"
+            try:
+                claim_response = await client.post(claim_url, headers=headers)
+                if claim_response.status_code == 401:
+                    await bridge._force_refresh()
+                    headers = self._build_headers(bridge._current_sess().identity.security_oauth_token)
+                    claim_response = await client.post(claim_url, headers=headers)
+                data = claim_response.json() if claim_response.status_code == 200 else None
+                if isinstance(data, dict) and isinstance(data.get("data"), dict):
+                    data = data["data"]
+                if not (
+                    claim_response.status_code == 200
+                    and isinstance(data, dict)
+                    and data.get("status") == "CLAIMED"
+                ):
+                    raise RuntimeError(f"领取未确认（HTTP {claim_response.status_code}）")
+                confirmed += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                current = await self._claim_status(client, headers, campaign_id)
+                if current == "CLAIMED":
+                    recovered += 1
+                else:
+                    return CheckinOutcome("error", "领取失败，复查未确认")
+            amount = reward_of(campaign)
+            if amount is not None:
+                has_reward = True
+                reward += amount
+
+        if not confirmed and not recovered:
+            return CheckinOutcome("error", "领取未确认")
+        if not confirmed:
+            return CheckinOutcome("already", "已签到（复查确认）")
+        message = f"签到成功 +{reward} 积分" if has_reward else "签到成功"
+        return CheckinOutcome("success", message, reward if has_reward else None)
+
+    async def _claim_status(self, client: httpx.AsyncClient, headers: dict, campaign_id: str) -> str | None:
+        """复查某个活动的领取状态（用于领取结果不确定时）。"""
+        try:
+            response = await client.get(CAMPAIGNS_URL, headers=headers)
+            if response.status_code != 200:
+                return None
+            for item in campaigns_from(response.json()):
+                if str(item.get("campaignId")) == campaign_id:
+                    return item.get("claimStatus")
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    @staticmethod
+    def _build_headers(token: str) -> dict[str, str]:
+        headers = dict(_REQUEST_HEADERS)
+        headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+
+def start_background_task(bridge_factory, *, env=None, project_dir: str | None = None):
+    """按配置启动签到后台任务；未配置时返回 None（功能关闭）。"""
+    settings = resolve_settings(env=env, project_dir=project_dir)
+    if settings is None:
+        print("[checkin] 未配置签到（checkin.json / QODER_CHECKIN_PAT 均未设置），功能关闭")
+        return None
+    service = DailyCreditCheckin(settings, bridge_factory)
+    print(
+        f"[checkin] 已启用: {len(settings.pats)} 个账号, "
+        f"未领取时每 {settings.retry_seconds // 60} 分钟重试, "
+        f"刷新窗口 每日 {REFRESH_HOUR}:{REFRESH_MINUTE:02d} (UTC+8)"
+    )
+    return asyncio.create_task(service.run(), name="qoder-daily-checkin")

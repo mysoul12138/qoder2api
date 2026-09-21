@@ -22,6 +22,7 @@ import time
 import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+import checkin
 import qoder_auth
 from qoder_auth import AuthIdentity
 import models
@@ -602,11 +603,28 @@ def _extract_pat_from_request(request: Request) -> str | None:
     return None
 
 
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """随服务启动"每日签到"后台任务（详见 checkin.py）。
+
+    - 未配置 PAT（checkin.json / QODER_CHECKIN_PAT）时任务自动跳过，不影响主链路
+    - 服务关闭时取消任务，避免悬挂
+    """
+    task = checkin.start_background_task(bridge_factory=OpenAiBridge)
+    try:
+        yield
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
 def create_app() -> FastAPI:
     global _registry
     _registry = BridgeRegistry()
 
-    app = FastAPI(title="qoder2api")
+    app = FastAPI(title="qoder2api", lifespan=_lifespan)
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):

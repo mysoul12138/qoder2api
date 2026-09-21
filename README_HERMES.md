@@ -48,3 +48,30 @@ custom_providers:
 - **协议兼容**：全面兼容 OpenAI `/v1/chat/completions` 与 `/v1/models`，支持流式 SSE、工具调用与推理。
 - **环境隔离**：虚拟环境独立建立在 `H:\qoder2api\.venv`，完全不占用系统 C 盘。
 - **Windows 代理避坑**：启动脚本内已内置 `set NO_PROXY=*`，彻底防止 Windows 下 httpx 读取 IE 系统代理导致的请求超时。
+
+---
+
+## 5. 每日 100 Credits 自动领取（签到）
+
+服务启动后自动运行（随反代进程，无需单独脚本）。只要"当天还没领取"，无论几点启动、是否错过 10:00 刷新，都会自动补领；领取成功后当天不再重复，等到下一个刷新窗口（活动每日 10:00 UTC+8 刷新，10:05 起再检查）。
+
+配置（任选一种，环境变量优先）：
+
+1. 项目目录下 `checkin.json`（推荐；已加入 .gitignore，不会进版本库）：
+
+```json
+{
+  "pat": "pt-你的Qoder_PAT",
+  "retry_minutes": 30
+}
+```
+
+多账号：`"pats": ["pt-一", "pt-二"]`
+
+2. 环境变量：`QODER_CHECKIN_PAT`（多个用英文逗号分隔）、`QODER_CHECKIN_RETRY_MINUTES`（未领取时的重试间隔，默认 30 分钟）
+
+说明：
+
+- 认证复用桥自身会话（PAT → jobToken），无需额外配置
+- 领取过程与结果打印在服务日志里（`[checkin]` 前缀），成功示例如：`[checkin] nickXXXX: 签到成功 +100 积分`
+- 不配置则功能自动关闭，不影响主链路
