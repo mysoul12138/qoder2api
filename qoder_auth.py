@@ -292,6 +292,23 @@ class QoderAuthError(RuntimeError):
         self.detail = detail
 
 
+class QoderBusyError(RuntimeError):
+    """上游表示"忙 / 排队 / 暂不可用"（例如 code 10605），而不是鉴权失败。
+
+    为什么单列一类: 旧实现把带 403 信封的忙信号当成鉴权失败 → 白刷新一次会话
+    （还会轮换 token，连累其他在途请求），重试后依旧失败，最后以 500 收尾。
+    这类错误刷新无用，应让上层稍后重试或直接如实告诉客户端。
+    """
+
+    def __init__(self, detail: str = "", retry_after_seconds: int | None = None):
+        message = f"upstream busy: {detail}" if detail else "upstream busy"
+        if retry_after_seconds is not None:
+            message = f"{message} (retry after {retry_after_seconds}s)"
+        super().__init__(message)
+        self.detail = detail
+        self.retry_after_seconds = retry_after_seconds
+
+
 def _common_headers(
     machine_id: str, machine_token: str, machine_type: str, date: str, sig: str
 ) -> dict:
@@ -541,6 +558,9 @@ async def _call(
             resp = await client.get(full_url, headers=headers)
         if resp.status_code != 200:
             detail = resp.text[:300]
+            busy = _busy_from_text(detail)
+            if busy is not None:
+                raise QoderBusyError(*busy)
             if resp.status_code in (401, 403):
                 raise QoderAuthError(resp.status_code, detail)
             raise RuntimeError(f"HTTP {resp.status_code} body={detail}")
@@ -570,18 +590,114 @@ async def open_stream_lines(
         ) as resp:
             if resp.status_code != 200:
                 err_body = (await resp.aread()).decode("utf-8")[:300]
+                busy = _busy_from_text(err_body)
+                if busy is not None:
+                    raise QoderBusyError(*busy)
                 if resp.status_code in (401, 403):
                     raise QoderAuthError(resp.status_code, err_body)
                 raise RuntimeError(f"HTTP {resp.status_code} {err_body}")
 
             async for line in resp.aiter_lines():
-                if line:
-                    is_auth_err, detail = _detect_in_stream_auth_error(line)
-                    if is_auth_err:
-                        raise QoderAuthError(401, detail)
-                    yield line
+                if not line:
+                    continue
+                is_busy, busy_detail, retry_after = _detect_busy_line(line)
+                if is_busy:
+                    # 忙/排队不是鉴权失败: 绝不刷新会话(刷新只会白轮换 token,
+                    # 还可能连累其他在途请求), 直接上抛给调用方稍后重试。
+                    raise QoderBusyError(busy_detail, retry_after)
+                is_auth_err, detail = _detect_in_stream_auth_error(line)
+                if is_auth_err:
+                    raise QoderAuthError(401, detail)
+                yield line
 
     print("[stream] read complete")
+
+
+# 上游"忙 / 排队 / 暂不可用"信号: 这类信封也常带 403, 但刷新会话毫无意义。
+# 实测(2026-09-21)样本:
+#   {"statusCodeValue":403,"body":"{\"code\":\"10605\",\"message\":
+#     \"{\\\"isQueued\\\":false,\\\"retryAfterSeconds\\\":5,...}\"}"}
+_BUSY_CODES = frozenset({"10605"})
+_BUSY_MARKERS = ("isQueued", "serviceAvailable", "retryAfterSeconds", "waitTime", "queueType")
+
+
+def _busy_body_of(obj: dict) -> dict | None:
+    """取信封里的业务 body（也兼容没有信封包裹的裸 body）。"""
+    body = _parse_body(obj)
+    if isinstance(body, dict):
+        return body
+    if "code" in obj or "message" in obj:
+        return obj
+    return None
+
+
+def _busy_payload_of(body: dict) -> dict | None:
+    """body 若是忙/排队信号，返回其元数据（可能藏在 message 的 JSON 字符串里）。"""
+    payload = body.get("message")
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except (json.JSONDecodeError, ValueError):
+            payload = None
+    if isinstance(payload, dict):
+        return payload
+    if any(key in body for key in _BUSY_MARKERS):
+        return body
+    if str(body.get("code") or "") in _BUSY_CODES:
+        return {}
+    return None
+
+
+def detect_upstream_busy(obj: dict) -> tuple[bool, str, int | None]:
+    """识别"上游忙 / 排队"。返回 (是否忙, 说明, 建议重试秒数)。"""
+    if not isinstance(obj, dict):
+        return False, "", None
+    body = _busy_body_of(obj)
+    if body is None:
+        return False, "", None
+    payload = _busy_payload_of(body)
+    if payload is None:
+        return False, "", None
+
+    code = str(body.get("code") or "")
+    detail = " ".join(
+        part
+        for part in (code, json.dumps(payload, ensure_ascii=False) if payload else "")
+        if part
+    )
+    raw_retry = payload.get("retryAfterSeconds")
+    retry_after = (
+        max(0, int(raw_retry))
+        if isinstance(raw_retry, (int, float)) and not isinstance(raw_retry, bool)
+        else None
+    )
+    return True, detail or "busy", retry_after
+
+
+def _detect_busy_line(line: str) -> tuple[bool, str, int | None]:
+    """从 SSE 行里识别忙/排队信号。"""
+    s = line.strip()
+    if not s.startswith("data:"):
+        return False, "", None
+    try:
+        obj = json.loads(s[5:].strip())
+    except (json.JSONDecodeError, ValueError):
+        return False, "", None
+    if not isinstance(obj, dict):
+        return False, "", None
+    return detect_upstream_busy(obj)
+
+
+def _busy_from_text(text: str) -> tuple[str, int | None] | None:
+    """从原始响应文本里识别忙/排队信号；命中返回 (说明, 建议重试秒数)。"""
+    try:
+        obj = json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    is_busy, detail, retry_after = detect_upstream_busy(obj)
+    return (detail, retry_after) if is_busy else None
 
 
 def _detect_in_stream_auth_error(line: str) -> tuple[bool, str]:
@@ -590,6 +706,9 @@ def _detect_in_stream_auth_error(line: str) -> tuple[bool, str]:
         data:{"body":"{\"code\":\"105\",\"message\":\"Login expired\"}",
               "statusCodeValue":403,"statusCode":"FORBIDDEN"}
     Detect that and surface it as an auth error so callers can refresh+retry.
+
+    注意: 带 403 信封的"忙 / 排队"信号（如 code 10605）必须先排除 —— 它不是
+    鉴权失败，刷新会话没有用（只会白轮换 token）。
     """
     s = line.strip()
     if not s.startswith("data:"):
@@ -599,6 +718,9 @@ def _detect_in_stream_auth_error(line: str) -> tuple[bool, str]:
     except (json.JSONDecodeError, ValueError):
         return False, ""
     if not isinstance(obj, dict):
+        return False, ""
+
+    if detect_upstream_busy(obj)[0]:
         return False, ""
 
     scv = obj.get("statusCodeValue")

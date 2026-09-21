@@ -442,7 +442,15 @@ class OpenAiBridge:
                     err_chunk = _make_chunk(req_id, created, model)
                     err_chunk["choices"][0]["finish_reason"] = "error"
                     err_chunk["choices"][0]["delta"] = {}
-                    err_chunk["error"] = {"message": str(e), "type": "qoder_error"}
+                    err_chunk["error"] = {
+                        "message": str(e),
+                        # 上游忙/排队单列一类: 客户端可据此退避重试, 而不是当鉴权失败
+                        "type": (
+                            "upstream_busy"
+                            if isinstance(e, qoder_auth.QoderBusyError)
+                            else "qoder_error"
+                        ),
+                    }
                     await aq.put(
                         f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
                     )
@@ -673,6 +681,18 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 {"error": {"message": str(e), "type": "invalid_request_error"}},
                 status_code=400,
+            )
+        except qoder_auth.QoderBusyError as e:
+            # 上游忙/排队: 不是本端的错, 用 503 + Retry-After 让客户端稍后再试
+            headers = (
+                {"Retry-After": str(e.retry_after_seconds)}
+                if e.retry_after_seconds is not None
+                else None
+            )
+            return JSONResponse(
+                {"error": {"message": str(e), "type": "upstream_busy"}},
+                status_code=503,
+                headers=headers,
             )
         except Exception as e:
             return JSONResponse(

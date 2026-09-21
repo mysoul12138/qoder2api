@@ -89,3 +89,16 @@ custom_providers:
 - 额外带上上游的 `credits`（本次消耗积分），便于核对用量
 
 实现：`usage.py`（提取 + 映射，纯函数、可单测）+ `transform.extract_usage_line`（信封解包）。
+
+---
+
+## 7. 上游"忙 / 排队"的处理
+
+上游繁忙时会用 `code 10605` 之类的信封（常带 403）告知"忙 / 排队"。这类回应**不是鉴权失败**：
+
+- 不再误判为 401 → 不再白刷新会话（旧行为会轮换 token，连累其他在途请求）
+- 非流式：返回 **HTTP 503 + `Retry-After`**（上游给了 `retryAfterSeconds` 时），`error.type = "upstream_busy"`
+- 流式：流内错误 chunk 的 `error.type = "upstream_busy"`，客户端可据此退避重试
+- 真正的登录过期（`code 105` / 401 / 403 无忙标记）仍照旧刷新会话重试一次
+
+实现：`qoder_auth.QoderBusyError` + `detect_upstream_busy()`（分类），桥接层负责状态码映射。
