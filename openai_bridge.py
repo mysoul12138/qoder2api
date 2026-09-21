@@ -26,6 +26,7 @@ import checkin
 import qoder_auth
 from qoder_auth import AuthIdentity
 import models
+import usage
 from transform import (
     StreamAccumulator,
     ToolCallAccumulator,
@@ -35,6 +36,7 @@ from transform import (
     _extract_latest_user_prompt,
     _extract_message_images,
     _make_chunk,
+    extract_usage_line,
     parse_tool_calls_text,
 )
 
@@ -401,13 +403,20 @@ class OpenAiBridge:
         )
 
         async def producer():
+            collected: usage.UpstreamUsage | None = None
             try:
                 async for line in self._open_stream_async(url, body, extra_headers):
                     if not line.startswith("data:"):
                         continue
-                    delta = _extract_delta(line[5:].strip())
+                    payload = line[5:].strip()
+                    delta = _extract_delta(payload)
                     if not delta.is_empty():
                         acc.accept(delta)
+                    found = extract_usage_line(payload)
+                    if found is not None:
+                        collected = (
+                            found if collected is None else collected.merged_with(found)
+                        )
                 acc.flush()
 
                 # finish chunk
@@ -415,6 +424,17 @@ class OpenAiBridge:
                 done["choices"][0]["finish_reason"] = acc.finish_reason()
                 done["choices"][0]["delta"] = {}
                 await aq.put(f"data: {json.dumps(done, ensure_ascii=False)}\n\n")
+
+                # usage chunk（OpenAI stream_options.include_usage 风格，必须在 [DONE] 之前）:
+                # 下游用 prompt_tokens_details.cached_tokens 算缓存命中率,
+                # 用 completion_tokens 算每秒输出 token 数。
+                if collected is not None:
+                    usage_chunk = _make_chunk(req_id, created, model)
+                    usage_chunk["choices"] = []
+                    usage_chunk["usage"] = usage.to_openai_usage(collected)
+                    await aq.put(
+                        f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
+                    )
             except Exception as e:
                 # 必须把错误暴露给客户端,否则 OpenAI 兼容客户端会把截断的流当成正常结束。
                 print(f"[bridge] stream error: {e}")
@@ -446,17 +466,22 @@ class OpenAiBridge:
         full_content: list[str] = []
         full_reasoning_content: list[str] = []
         tool_calls = ToolCallAccumulator()
+        collected: usage.UpstreamUsage | None = None
 
         async for line in self._open_stream_async(url, body, extra_headers):
             if not line.startswith("data:"):
                 continue
-            delta = _extract_delta(line[5:].strip())
+            payload = line[5:].strip()
+            delta = _extract_delta(payload)
             if delta.reasoning_content:
                 full_reasoning_content.append(delta.reasoning_content)
             if delta.content:
                 full_content.append(delta.content)
             if delta.tool_calls and len(delta.tool_calls) > 0:
                 tool_calls.append(delta.tool_calls)
+            found = extract_usage_line(payload)
+            if found is not None:
+                collected = found if collected is None else collected.merged_with(found)
 
         full_text = "".join(full_content)
         fallback_tool_calls = None
@@ -495,11 +520,8 @@ class OpenAiBridge:
                     "finish_reason": finish_reason,
                 }
             ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
+            # 真实 usage 透传: cached_tokens → 缓存命中率, completion_tokens → 每秒 token 数
+            "usage": usage.to_openai_usage(collected),
         }
         return out
 

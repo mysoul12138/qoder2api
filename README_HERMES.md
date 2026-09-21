@@ -75,3 +75,17 @@ custom_providers:
 - 认证复用桥自身会话（PAT → jobToken），无需额外配置
 - 领取过程与结果打印在服务日志里（`[checkin]` 前缀），成功示例如：`[checkin] nickXXXX: 签到成功 +100 积分`
 - 不配置则功能自动关闭，不影响主链路
+
+---
+
+## 6. 指标透传（缓存命中率 / 每秒 token 数）
+
+上游在每次回答末尾会下发 usage（prompt / completion / total / `prompt_tokens_details.cached_tokens` / `credits`）。本桥原先把 usage 写死成 0，导致 Hermes 侧拿不到缓存命中率和每秒输出 token 数；现已改为真实透传：
+
+- **流式**：在 `[DONE]` 之前补一个 OpenAI `stream_options.include_usage` 风格的 usage chunk（`choices: []`）
+- **非流式**：响应体的 `usage` 直接来自上游
+- `prompt_tokens_details.cached_tokens` 是客户端算缓存命中率的标准字段；`completion_tokens` 是算每秒 token 数的分子
+- 上游没上报的字段不写入响应（避免把"没上报"伪装成 0）
+- 额外带上上游的 `credits`（本次消耗积分），便于核对用量
+
+实现：`usage.py`（提取 + 映射，纯函数、可单测）+ `transform.extract_usage_line`（信封解包）。

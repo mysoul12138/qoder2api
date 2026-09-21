@@ -7,6 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import copy
 import json
+import usage
 
 
 @dataclass
@@ -595,11 +596,41 @@ def _make_sse_chunk(
     return f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
 
+def extract_usage_line(data_line: str) -> usage.UpstreamUsage | None:
+    """从上游 SSE 行（信封格式）里提取 usage；没有则返回 None。
+
+    信封形如:
+        {"headers": {...}, "body": "<inner json 字符串>", "statusCodeValue": 200, ...}
+    结束行的 body 是 "[DONE]"（非 JSON），属预期，静默跳过。
+    """
+    try:
+        wrapper = json.loads(data_line)
+    except Exception:  # noqa: BLE001 非 JSON 行（心跳 / 注释）属预期
+        return None
+    if not isinstance(wrapper, dict):
+        return usage.find_usage(wrapper)
+
+    inner = wrapper.get("body")
+    if isinstance(inner, str):
+        text = inner.strip()
+        if not text or text == "[DONE]":
+            return None
+        try:
+            inner = json.loads(text)
+        except Exception:  # noqa: BLE001 非 JSON body（结束标记等）
+            return None
+    payload = inner if inner is not None else wrapper
+    return usage.find_usage(payload)
+
+
 def _extract_delta(data_line: str) -> BridgeDelta:
     try:
         wrapper = json.loads(data_line)
+        if not isinstance(wrapper, dict):
+            return BridgeDelta()
         inner_str = wrapper.get("body", "")
-        if not inner_str:
+        if not inner_str or inner_str.strip() == "[DONE]":
+            # 上游结束标记（非 JSON），属预期，不记日志
             return BridgeDelta()
         inner_json = json.loads(inner_str)
         for ch in inner_json.get("choices", []):
