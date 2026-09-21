@@ -16,3 +16,13 @@ __pycache__/
 # 系统
 .DS_Store
 Thumbs.db
+
+# 虚拟环境与进程锁
+.venv/
+*.pid
+
+# CodeGraph 本地索引（可再生，勿入库）
+.codegraph/
+
+# 本机签到配置（含 PAT 凭据，勿入库）
+checkin.json
