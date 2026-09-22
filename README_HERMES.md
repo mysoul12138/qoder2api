@@ -164,3 +164,22 @@ custom_providers:
 ### 签到与池共用账号
 
 每日 100 Credits 签到名单 = `checkin.json` 的 pat/pats **∪ 账号池全部 PAT**（pool.json / QODER_POOL_PATS，自动去重并入）——往池里加新账号，签到不用另配，配合热加载下一个签到周期即吃。仅当显式设置 `QODER_CHECKIN_PAT` 时才完全覆盖、不并池。
+
+---
+
+## 9. 思考强度档位透传（reasoning_effort）
+
+客户端（如 Hermes custom provider）在 OpenAI 请求**顶层**发 `reasoning_effort`，本桥归一后注入 Qoder 上游 `parameters:{enable_thinking:true, reasoning_effort:low|medium|xhigh}`（上游实测只认三档，无 high）：
+
+| 客户端档位 | 注入上游 |
+|---|---|
+| none / minimal / low | low |
+| medium / high | medium |
+| xhigh / max / ultra | xhigh |
+| 未传 / 未知值 | 不注入（上游默认 medium，与旧行为一致） |
+
+Hermes 侧 `agent.reasoning_effort` 经 custom profile 钳到 OpenAI 兼容集后发出（如 ultra → 线上为 max → 本桥归一 xhigh）。
+
+真机实测（2026-09-22，Qwen3.8-Flash 同题推理）：low 档 reasoning_tokens 4096（127s）↔ xhigh 档 11590（245s），约 2.8 倍，档位真实生效。
+
+> `none` 暂映射到 low 而非关闭思考——上游是否接受 `enable_thinking:false` 未实测，不冒进。

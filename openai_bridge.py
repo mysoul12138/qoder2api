@@ -27,6 +27,7 @@ import checkin
 import qoder_auth
 from qoder_auth import AuthIdentity
 import models
+import reasoning
 import usage
 from transform import (
     StreamAccumulator,
@@ -346,6 +347,12 @@ class OpenAiBridge:
         body["chat_context"]["extra"]["modelConfig"]["is_reasoning"] = True
         body["business"]["id"] = str(uuid.uuid4())
         body["business"]["begin_at"] = time.time_ns() // 1_000_000
+
+        # 思考强度: 客户端顶层 reasoning_effort → 上游 parameters 三档注入。
+        # 未传/未知值不注入, 保持上游默认 (medium), 与旧行为一致。
+        effort = reasoning.apply_reasoning_effort(body, req_body)
+        if effort is not None:
+            print(f"[bridge] reasoning effort: {req_body.get('reasoning_effort')!r} -> {effort}")
 
         prompt = _extract_latest_user_prompt(messages)
         body["chat_context"]["text"]["text"] = prompt
