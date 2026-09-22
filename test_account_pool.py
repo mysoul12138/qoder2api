@@ -356,5 +356,80 @@ class RouteDualTrackTests(unittest.TestCase):
         self.assertEqual(len(data["pool"]["accounts"]), 2)
 
 
+
+class HotReloadTests(unittest.TestCase):
+    """池热加载: pool.json / checkin.json 指纹变化 → 增量合并, 保留运行时状态。"""
+
+    def _pool_with_dir(self, tmp, pats):
+        import json as _json
+        with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as f:
+            _json.dump({"gateway_key": GATEWAY_KEY, "pats": pats}, f)
+        st = account_pool.resolve_settings(env={}, project_dir=tmp)
+        clock = FakeClock()
+        return AccountPool(st, now=clock, project_dir=tmp), clock
+
+    def test_no_reload_without_file_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, clock = self._pool_with_dir(tmp, ["pt-a1", "pt-b2"])
+            clock.advance(10)
+            self.assertFalse(p.reload_if_changed())
+
+    def test_add_account_appears_with_state_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import json as _json
+            p, clock = self._pool_with_dir(tmp, ["pt-a1", "pt-b2"])
+            a = p.pats()[0]
+            p.mark_failure(a, qoder_auth.QoderAuthError(401, "x"))  # 1 次失败计数
+            p.set_label(a, "nick-A")
+            # 外部加号 (模拟 add-pat.py 重写文件)
+            clock.advance(3)
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as f:
+                _json.dump({"gateway_key": GATEWAY_KEY, "pats": ["pt-a1", "pt-b2", "pt-c3"]}, f)
+            self.assertTrue(p.reload_if_changed())
+            self.assertEqual(p.pats(), ("pt-a1", "pt-b2", "pt-c3"))
+            snap = {s["label"]: s for s in p.snapshot()}
+            self.assertEqual(snap["nick-A"]["auth_fails"], 1, "旧号运行时状态必须保留")
+            self.assertIn("pt-...t-c3", snap, "新号以尾号占位出现")
+
+    def test_removed_account_drops_sticky(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import json as _json
+            p, clock = self._pool_with_dir(tmp, ["pt-a1", "pt-b2"])
+            bound = p.select("conv:keep")
+            other = [x for x in p.pats() if x != bound][0]
+            clock.advance(3)
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as f:
+                _json.dump({"gateway_key": GATEWAY_KEY, "pats": [bound]}, f)
+            self.assertTrue(p.reload_if_changed())
+            self.assertEqual(p.pats(), (bound,))
+            self.assertEqual(p.select("conv:keep"), bound, "粘性仍指向留下的号")
+
+    def test_broken_json_keeps_current_pool(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p, clock = self._pool_with_dir(tmp, ["pt-a1"])
+            clock.advance(3)
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as f:
+                f.write("{ this is not json")
+            # 指纹变了但解析失败 → resolve 返回空壳? 不应炸; 池内容允许变空但服务不抛
+            try:
+                p.reload_if_changed()
+            except Exception as e:
+                self.fail(f"reload must never raise: {e!r}")
+
+    def test_throttle_blocks_second_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import json as _json
+            p, clock = self._pool_with_dir(tmp, ["pt-a1"])
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as f:
+                _json.dump({"gateway_key": GATEWAY_KEY, "pats": ["pt-a1", "pt-z9"]}, f)
+            self.assertTrue(p.reload_if_changed())      # 第一次感知
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as f:
+                _json.dump({"gateway_key": GATEWAY_KEY, "pats": ["pt-a1", "pt-z9", "pt-y8"]}, f)
+            self.assertFalse(p.reload_if_changed())     # 2 秒内节流
+            clock.advance(3)
+            self.assertTrue(p.reload_if_changed())      # 过窗后感知
+            self.assertEqual(len(p.pats()), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

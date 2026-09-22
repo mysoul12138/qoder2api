@@ -257,17 +257,33 @@ def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSetting
 class DailyCreditCheckin:
     """进程内签到后台任务（多账号顺序处理）。"""
 
-    def __init__(self, settings: CheckinSettings, bridge_factory, *, client_factory=None, now=None):
+    def __init__(self, settings: CheckinSettings, bridge_factory, *, client_factory=None, now=None,
+                 env=None, project_dir: str | None = None):
         self._settings = settings
         self._bridge_factory = bridge_factory
         self._client_factory = client_factory or (
             lambda: httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS, follow_redirects=False)
         )
         self._now = now or (lambda: datetime.now(timezone.utc))
+        # 保留配置来源引用: 每轮签到前重读名单, 配合池热加载 —— 中途加的新号
+        # 无需重启, 下一个刷新窗口即自动纳入签到。
+        self._env = env
+        self._project_dir = project_dir
+
+    def _refresh_roster(self) -> None:
+        try:
+            latest = resolve_settings(env=self._env, project_dir=self._project_dir)
+        except Exception as exc:  # noqa: BLE001 重读失败沿用旧名单
+            print(f"[checkin] WARN 重读名单失败, 沿用当前名单: {exc!r}")
+            return
+        if latest is not None and latest.pats != self._settings.pats:
+            print(f"[checkin] 名单已更新: {len(self._settings.pats)} -> {len(latest.pats)} 个账号")
+            self._settings = latest
 
     async def run(self) -> None:
         """主循环：启动即补领，之后按 next_check_plan 决定下一次检查时间。"""
         while True:
+            self._refresh_roster()
             outcomes: list[CheckinOutcome] = []
             for pat in self._settings.pats:
                 try:
@@ -425,7 +441,10 @@ def start_background_task(bridge_factory, *, env=None, project_dir: str | None =
     if settings is None:
         print("[checkin] 未配置签到（checkin.json / QODER_CHECKIN_PAT 均未设置），功能关闭")
         return None
-    service = DailyCreditCheckin(settings, bridge_factory)
+    service = DailyCreditCheckin(
+        settings, bridge_factory,
+        env=env, project_dir=project_dir,
+    )
     print(
         f"[checkin] 已启用: {len(settings.pats)} 个账号, "
         f"未落定时每 {settings.retry_seconds // 60} 分钟重试, "

@@ -681,7 +681,7 @@ async def _pool_quota_refresher():
 
     p = _pool
     while p is not None and p.enabled:
-        for pat in p.pats():
+        for pat in list(p.pats()):
             try:
                 bridge = await _account_for_pat(pat)
                 status = await qoder_auth.user_status(
@@ -696,7 +696,13 @@ async def _pool_quota_refresher():
                 raise
             except Exception as e:  # noqa: BLE001 巡检失败不影响主链路
                 print(f"[pool] quota check pt-...{pat[-4:]} failed: {e}")
-        await _a.sleep(pool_mod._STATUS_REFRESH_INTERVAL_SEC)
+        # 分片睡眠: 池热加载 (账号增删) 后无需等完整周期即可对新号巡检
+        waited = 0.0
+        while waited < pool_mod.STATUS_REFRESH_INTERVAL_SEC:
+            await _a.sleep(5)
+            waited += 5
+            if p.reload_if_changed():
+                break
 
 
 def _get_setting(key: str) -> str | None:
@@ -731,7 +737,10 @@ async def _lifespan(app: FastAPI):
     - 未配置 PAT（checkin.json / QODER_CHECKIN_PAT）时任务自动跳过，不影响主链路
     - 服务关闭时取消任务，避免悬挂
     """
-    task = checkin.start_background_task(bridge_factory=OpenAiBridge)
+    project_dir = _get_setting("QODER_PROJECT_DIR") or None
+    task = checkin.start_background_task(
+        bridge_factory=OpenAiBridge, project_dir=project_dir
+    )
     quota_task = None
     if _pool is not None and _pool.enabled:
         quota_task = asyncio.create_task(
@@ -750,8 +759,10 @@ async def _lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     global _registry, _pool
     _registry = BridgeRegistry()
-    pool_settings = pool_mod.resolve_settings()
-    _pool = pool_mod.AccountPool(pool_settings)
+    # 配置目录: 默认与代码同目录; QODER_PROJECT_DIR 可外置 (多实例/容器场景)
+    project_dir = _get_setting("QODER_PROJECT_DIR") or os.path.dirname(os.path.abspath(__file__))
+    pool_settings = pool_mod.resolve_settings(project_dir=project_dir)
+    _pool = pool_mod.AccountPool(pool_settings, project_dir=project_dir)
     if _pool.enabled:
         print(
             f"[pool] 账号池已启用: {len(pool_settings.pats)} 个账号"
@@ -779,6 +790,9 @@ def create_app() -> FastAPI:
                 )
             req_body = await request.json()
             p = _pool
+            if p is not None:
+                # 热加载: pool.json / checkin.json 被外部改过时增量合并 (2s 节流)
+                p.reload_if_changed()
 
             # ── 双轨鉴权: pt- 前缀直通该账号; 网关 key 走账号池选号 ──
             if raw_pat.startswith("pt-") or not (p is not None and p.gateway_enabled and p.is_gateway_key(raw_pat)):

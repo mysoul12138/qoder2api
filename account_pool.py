@@ -178,14 +178,34 @@ def resolve_settings(env=None, project_dir: str | None = None) -> PoolSettings:
     return st
 
 
+def _config_fingerprint(project_dir: str) -> tuple:
+    """配置文件指纹: (path, mtime_ns, size) 序列; 文件不存在记 (None, None, None)。
+
+    用 os.stat 而非读内容: 便宜, 且 add-pat 脚本原子重写文件后必然变化。
+    """
+    fp = []
+    for name in ("pool.json", "checkin.json"):
+        path = os.path.join(project_dir, name)
+        try:
+            st = os.stat(path)
+            fp.append((name, st.st_mtime_ns, st.st_size))
+        except OSError:
+            fp.append((name, None, None))
+    return tuple(fp)
+
+
 class AccountPool:
     """线程安全的账号池: 选号 / 粘性 / 冷却状态机 / 余额巡检数据落点。
 
     网络调用全部在路由层异步进行, 本类只做纯状态计算 —— 因此用
     threading.Lock 保护短临界区即可, 不会阻塞事件循环。
+
+    热加载: 配置文件 (pool.json / checkin.json) 的 (mtime_ns, size) 指纹变化时,
+    reload_if_changed() 增量合并新配置 —— 新账号即时进池, 已有账号保留运行时
+    状态 (冷却/失败计数/昵称), 被移除的账号同步清掉粘性绑定。
     """
 
-    def __init__(self, settings: PoolSettings, now=time.time) -> None:
+    def __init__(self, settings: PoolSettings, now=time.time, project_dir: str | None = None) -> None:
         self._s = settings
         self._now = now
         self._lock = threading.Lock()
@@ -194,6 +214,57 @@ class AccountPool:
             p: AccountState(pat=p) for p in settings.pats
         }
         self._sticky: dict[str, tuple[str, float]] = {}  # sticky_key -> (pat, 到期)
+        self._project_dir = project_dir or os.path.dirname(os.path.abspath(__file__))
+        self._config_fingerprint = _config_fingerprint(self._project_dir)
+        self._last_reload_check = 0.0
+
+    # ── 热加载 ──────────────────────────────────────────────
+    def reload_if_changed(self, force: bool = False) -> bool:
+        """配置文件变化则增量重载; 返回本次是否发生了重载。
+
+        每次请求都会调这里, 所以先做 2 秒节流, 避免 stat 风暴。
+        环境变量 (QODER_POOL_PATS/QODER_GATEWAY_KEY) 是进程启动时快照,
+        热加载只认文件; env 存在时 resolve_settings 会照常覆盖, 语义不变。
+        """
+        now = self._now()
+        if not force and now - self._last_reload_check < 2.0:
+            return False
+        self._last_reload_check = now
+        fp = _config_fingerprint(self._project_dir)
+        if fp == self._config_fingerprint:
+            return False
+        self._config_fingerprint = fp
+        try:
+            new_settings = resolve_settings(project_dir=self._project_dir)
+        except Exception as exc:  # noqa: BLE001 重载失败不炸主链路
+            print(f"[pool] WARN 重载配置失败, 维持现有账号池: {exc!r}")
+            return False
+        self.apply_settings(new_settings)
+        return True
+
+    def apply_settings(self, new_settings: PoolSettings) -> None:
+        """增量合并新配置: 加新号 / 删旧号 / 更新 key 与参数, 保留既有状态。"""
+        with self._lock:
+            old_pats = set(self._accounts)
+            new_pats = list(new_settings.pats)
+            for p in new_pats:
+                if p not in self._accounts:
+                    self._accounts[p] = AccountState(pat=p)
+            for p in old_pats - set(new_pats):
+                del self._accounts[p]
+            # 重建顺序以匹配新配置顺序 (dict 重排)
+            self._accounts = {p: self._accounts[p] for p in new_pats}
+            # 被移除账号的粘性绑定一并作废
+            for k in [k for k, (pat, _) in self._sticky.items() if pat not in self._accounts]:
+                self._sticky.pop(k, None)
+            self._s = new_settings
+            added = set(new_pats) - old_pats
+            removed = old_pats - set(new_pats)
+            if added or removed:
+                print(
+                    f"[pool] 热加载: +{len(added)} 个账号, -{len(removed)} 个"
+                    f" (来源 {new_settings.source}), 现共 {len(new_pats)} 个"
+                )
 
     # ── 基本属性 ─────────────────────────────────────────────
     @property

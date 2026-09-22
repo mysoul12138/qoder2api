@@ -365,5 +365,41 @@ class CheckinConfigTests(unittest.TestCase):
             self.assertEqual(settings.pats, ("pt-p1", "pt-p2"))
 
 
+
+class CheckinRosterReloadTests(unittest.TestCase):
+    """签到名单热更新: 每轮 run 前重读配置, 中途加的池账号无需重启。"""
+
+    def test_refresh_roster_picks_up_new_pat(self):
+        import account_pool
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as fh:
+                json.dump({"gateway_key": "gk", "pats": ["pt-one"]}, fh)
+            settings = checkin.resolve_settings(env={}, project_dir=tmp)
+            self.assertEqual(settings.pats, ("pt-one",))
+            service = checkin.DailyCreditCheckin(
+                settings, lambda pat: None, env={}, project_dir=tmp
+            )
+            # 外部加号后重读: 名单应扩容
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as fh:
+                json.dump({"gateway_key": "gk", "pats": ["pt-one", "pt-two"]}, fh)
+            service._refresh_roster()
+            self.assertEqual(service._settings.pats, ("pt-one", "pt-two"))
+
+    def test_refresh_roster_failure_keeps_old_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "checkin.json"), "w", encoding="utf-8") as fh:
+                json.dump({"pat": "pt-keep"}, fh)
+            settings = checkin.resolve_settings(env={}, project_dir=tmp)
+            service = checkin.DailyCreditCheckin(
+                settings, lambda pat: None, env={}, project_dir=tmp
+            )
+            # 把 resolve_settings 打桩成抛异常: 名单必须原样保留, 不炸循环
+            import unittest.mock as m
+            with m.patch.object(checkin, "resolve_settings", side_effect=RuntimeError("boom")):
+                service._refresh_roster()
+            self.assertEqual(service._settings.pats, ("pt-keep",))
+
+
 if __name__ == "__main__":
     unittest.main()

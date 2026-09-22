@@ -147,6 +147,20 @@ custom_providers:
 
 `GET /status` 返回各账号脱敏状态（昵称/尾号、ok|cooldown|quota_exceeded、冷却剩余、连续失败数、quota、nextResetAt），不含 PAT 明文。
 
+### 热加载（加账号不用重启）
+
+服务每次请求前检查 `pool.json` / `checkin.json` 的文件指纹（2 秒节流），变化即增量合并：新账号即时进池，已有账号的冷却/失败计数/昵称全部保留，被删账号自动作废其会话粘性。签到任务每轮开始前也重读名单。即：**双击 add-pat.cmd 加号 → 下一个请求/签到周期自动生效**。配置目录可用 `QODER_PROJECT_DIR` 外置（多实例场景）。
+
+### 一键加号：add-pat.cmd
+
+对标 workbuddy2api 的 login-helper 交互。双击运行（或在 cmd 里带参数 `add-pat.cmd pt-xxx ...`）：
+
+1. 命令窗口粘贴 PAT（输入不回显，不落日志）
+2. 立即向 Qoder 网关验证（jobToken 冷交换确认真实昵称，坏号/格式错当场拒绝，绝不写入）
+3. 合并写入 `pool.json`；首次使用自动生成随机 `gateway_key` 并在窗口打印
+4. 若只有 `checkin.json` 旧配置，其中 PAT 自动并入 pool.json（一次性迁移）
+5. 检测到服务在跑则提示热加载自动生效，无需重启
+
 ### 签到与池共用账号
 
-每日 100 Credits 签到名单 = `checkin.json` 的 pat/pats **∪ 账号池全部 PAT**（pool.json / QODER_POOL_PATS，自动去重并入）——往池里加新账号，签到不用另配，重启即吃。仅当显式设置 `QODER_CHECKIN_PAT` 时才完全覆盖、不并池。
+每日 100 Credits 签到名单 = `checkin.json` 的 pat/pats **∪ 账号池全部 PAT**（pool.json / QODER_POOL_PATS，自动去重并入）——往池里加新账号，签到不用另配，配合热加载下一个签到周期即吃。仅当显式设置 `QODER_CHECKIN_PAT` 时才完全覆盖、不并池。
