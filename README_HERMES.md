@@ -173,13 +173,12 @@ custom_providers:
 
 | 客户端档位 | 注入上游 |
 |---|---|
-| none / minimal / low | low |
+| **none** | `parameters:{enable_thinking:false}` — 真关思考（实测） |
+| minimal / low | low |
 | medium / high | medium |
 | xhigh / max / ultra | xhigh |
 | 未传 / 未知值 | 不注入（上游默认 medium，与旧行为一致） |
 
 Hermes 侧 `agent.reasoning_effort` 经 custom profile 钳到 OpenAI 兼容集后发出（如 ultra → 线上为 max → 本桥归一 xhigh）。
 
-真机实测（2026-09-22，Qwen3.8-Flash 同题推理）：low 档 reasoning_tokens 4096（127s）↔ xhigh 档 11590（245s），约 2.8 倍，档位真实生效。
-
-> `none` 暂映射到 low 而非关闭思考——上游是否接受 `enable_thinking:false` 未实测，不冒进。
+真机实测：①档位——Qwen3.8-Flash 同题，low reasoning_tokens 4096（127s）↔ xhigh 11590（245s），约 2.8 倍；②关思考——Qwen3.7-Plus 陷阱题（9.11 vs 9.9），开思考 reasoning 422 字且答对，`enable_thinking:false` 后 reasoning 归零、耗时 4.7s→1.4s、答错——参数被真实执行而非忽略（`is_reasoning` 配 true/false 均不报错）。

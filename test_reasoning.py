@@ -12,7 +12,8 @@ import models
 class NormalizeTests(unittest.TestCase):
     def test_wire_values_map_to_upstream_three_tiers(self):
         cases = {
-            "none": "low", "minimal": "low", "low": "low",
+            "none": reasoning.THINKING_OFF,  # 实测可关: 落 enable_thinking=false
+            "minimal": "low", "low": "low",
             "medium": "medium", "high": "medium",
             "xhigh": "xhigh", "max": "xhigh", "ultra": "xhigh",
             "MAX": "xhigh", "  low  ": "low",  # 大小写与空白鲁棒
@@ -36,6 +37,13 @@ class ApplyTests(unittest.TestCase):
         self.assertEqual(
             body["parameters"], {"enable_thinking": True, "reasoning_effort": "xhigh"}
         )
+
+    def test_none_injects_thinking_off_without_effort(self):
+        body = self._body()
+        body["parameters"] = {"reasoning_effort": "stale"}  # 脏键也要被清掉
+        effort = reasoning.apply_reasoning_effort(body, {"reasoning_effort": "none"})
+        self.assertEqual(effort, reasoning.THINKING_OFF)
+        self.assertEqual(body["parameters"], {"enable_thinking": False})
 
     def test_absent_effort_leaves_body_untouched(self):
         body = self._body()
@@ -123,6 +131,10 @@ class HandleChatWiringTests(unittest.TestCase):
         body = self._run({"reasoning_effort": "max"})
         self.assertEqual(body["parameters"],
                          {"enable_thinking": True, "reasoning_effort": "xhigh"})
+
+    def test_none_true_off_on_wire_body(self):
+        body = self._run({"reasoning_effort": "none"})
+        self.assertEqual(body["parameters"], {"enable_thinking": False})
 
     def test_no_effort_no_parameters_on_wire_body(self):
         body = self._run({})
