@@ -337,6 +337,33 @@ class CheckinConfigTests(unittest.TestCase):
         )
         self.assertEqual(settings.retry_seconds, checkin.MIN_RETRY_SECONDS)
 
+    def test_pool_pats_auto_merged_into_checkin(self):
+        """池里新加的账号无需写进 checkin.json, 也自动吃每日签到。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "checkin.json"), "w", encoding="utf-8") as fh:
+                json.dump({"pat": "pt-legacy"}, fh)
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"gateway_key": "gk", "pats": ["pt-legacy", "pt-pool-2", "pt-pool-3"]},
+                    fh,
+                )
+            settings = checkin.resolve_settings(env={}, project_dir=tmp)
+            # 去重 + 顺序: checkin 的在前, 池新增的并入
+            self.assertEqual(settings.pats, ("pt-legacy", "pt-pool-2", "pt-pool-3"))
+            # 显式 QODER_CHECKIN_PAT 仍然完全覆盖, 不并池
+            only_env = checkin.resolve_settings(
+                env={"QODER_CHECKIN_PAT": "pt-explicit"}, project_dir=tmp
+            )
+            self.assertEqual(only_env.pats, ("pt-explicit",))
+
+    def test_pool_only_config_no_checkin_file(self):
+        """只有 pool.json (无 checkin.json) 时签到也吃到全部池账号。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "pool.json"), "w", encoding="utf-8") as fh:
+                json.dump({"gateway_key": "gk", "pats": ["pt-p1", "pt-p2"]}, fh)
+            settings = checkin.resolve_settings(env={}, project_dir=tmp)
+            self.assertEqual(settings.pats, ("pt-p1", "pt-p2"))
+
 
 if __name__ == "__main__":
     unittest.main()

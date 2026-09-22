@@ -26,8 +26,10 @@
       {"pat": "pt-...", "retry_minutes": 30}
       多账号: {"pats": ["pt-...", "pt-..."]}
   方式二 环境变量（优先级高于文件）:
-      QODER_CHECKIN_PAT              逗号分隔多账号
+      QODER_CHECKIN_PAT              逗号分隔多账号（显式指定则完全覆盖）
       QODER_CHECKIN_RETRY_MINUTES    重试间隔（分钟）
+  未显式指定 QODER_CHECKIN_PAT 时, 账号池 (pool.json / QODER_POOL_PATS) 里的
+  全部 PAT 自动并入签到名单 —— 加池号即吃签到, 无需两处各配一遍。
 """
 
 import asyncio
@@ -182,7 +184,16 @@ def next_check_plan(outcomes: list["CheckinOutcome"], now: datetime, retry_secon
 
 
 def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSettings | None:
-    """解析签到配置；未配置 PAT 返回 None（= 功能关闭）。"""
+    """解析签到配置；未配置 PAT 返回 None（= 功能关闭）。
+
+    账号来源优先级:
+      1. QODER_CHECKIN_PAT 环境变量 —— 显式指定, 完全覆盖 (向后兼容旧用法)
+      2. 否则取并集: checkin.json 的 pat/pats ∪ 账号池 (pool.json /
+         QODER_POOL_PATS / checkin.json 回退) 的 pats —— 池里加的每个账号都
+         自动吃到每日签到, 不需要两处配置各写一遍
+    """
+    import account_pool  # 延迟导入: 避免模块级环依赖, 且仅在需要时解析池配置
+
     env = os.environ if env is None else env
     project_dir = project_dir or os.path.dirname(os.path.abspath(__file__))
 
@@ -193,6 +204,7 @@ def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSetting
     if raw_env_pat:
         pats = [p.strip() for p in raw_env_pat.split(",") if p.strip()]
     else:
+        # 2a. checkin.json 自身配置
         config_path = os.path.join(project_dir, "checkin.json")
         if os.path.exists(config_path):
             try:
@@ -200,15 +212,13 @@ def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSetting
                     config = json.load(fh)
             except Exception as exc:  # noqa: BLE001
                 print(f"[checkin] checkin.json 读取失败: {exc!r}")
-                return None
+                config = None
             if isinstance(config, dict):
                 single = config.get("pat")
                 if isinstance(single, str) and single.strip():
-                    pats = [single.strip()]
-                else:
-                    multiple = config.get("pats")
-                    if isinstance(multiple, list):
-                        pats = [str(p).strip() for p in multiple if str(p).strip()]
+                    pats.append(single.strip())
+                elif isinstance(config.get("pats"), list):
+                    pats.extend(str(p).strip() for p in config["pats"] if str(p).strip())
                 retry_minutes = config.get("retry_minutes")
                 if (
                     isinstance(retry_minutes, (int, float))
@@ -216,6 +226,16 @@ def resolve_settings(env=None, project_dir: str | None = None) -> CheckinSetting
                     and retry_minutes > 0
                 ):
                     retry_seconds = int(retry_minutes * 60)
+        # 2b. 并集: 账号池的 PAT 同样自动签到 (去重, 保持发现顺序)
+        pool_settings = account_pool.resolve_settings(env=env, project_dir=project_dir)
+        merged = list(pats)
+        for p in pool_settings.pats:
+            if p not in merged:
+                merged.append(p)
+        if pool_settings.pats and len(merged) > len(pats):
+            added = len(merged) - len(pats)
+            print(f"[checkin] 并入账号池 PAT {added} 个 (来源 {pool_settings.source})")
+        pats = merged
 
     raw_env_retry = (env.get("QODER_CHECKIN_RETRY_MINUTES") or "").strip()
     if raw_env_retry:

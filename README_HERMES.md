@@ -149,4 +149,4 @@ custom_providers:
 
 ### 签到与池共用账号
 
-每日 100 Credits 签到任务照常逐个 PAT 领取（配置来源同 pool.json/checkin.json 回退链）。
+每日 100 Credits 签到名单 = `checkin.json` 的 pat/pats **∪ 账号池全部 PAT**（pool.json / QODER_POOL_PATS，自动去重并入）——往池里加新账号，签到不用另配，重启即吃。仅当显式设置 `QODER_CHECKIN_PAT` 时才完全覆盖、不并池。
