@@ -88,5 +88,34 @@ class AddPatTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "pool.json")))
 
 
+@unittest.skipUnless(os.name == "nt", "msvcrt 打码回显仅限 Windows 控制台")
+class MaskedInputTests(unittest.TestCase):
+    """_read_masked: 逐字符回显 *, 退格删星, 方向键吞码不入串, 回车提交。"""
+
+    def _feed(self, keys):
+        import msvcrt
+
+        it = iter(keys)
+        buf = io.StringIO()
+        with patch.object(msvcrt, "getwch", lambda: next(it)), \
+                __import__("contextlib").redirect_stdout(buf):
+            got = add_pat._read_masked("P: ")
+        return got, buf.getvalue()
+
+    def test_typing_shows_stars(self):
+        got, out = self._feed(list("ab\x08cd\r"))
+        self.assertEqual(got, "acd")           # b 被退格删掉
+        self.assertTrue(out.startswith("P: "))  # 提示先出
+        self.assertEqual(out.count("*"), 4)     # a、b、c、d 各打一星 (退格只回扫, 星号字符仍在流里)
+
+    def test_arrow_key_swallowed(self):
+        got, _ = self._feed(["a", "\x00", "K", "b", "\r"])  # 按了左方向键
+        self.assertEqual(got, "ab")
+
+    def test_ctrl_c_raises(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self._feed(["\x03"])
+
+
 if __name__ == "__main__":
     unittest.main()

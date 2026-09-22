@@ -2,7 +2,7 @@
 add_pat — 交互式把 Qoder PAT 加入账号池 (对标 workbuddy2api 的 login-helper)。
 
 流程:
-  1. 命令窗口粘贴 PAT (getpass 静默输入, 不回显不落日志)
+  1. 命令窗口粘贴 PAT (打码回显: 逐字显示*, 不落日志)
   2. 实时验证: PAT → jobToken 冷交换 (qoder_auth), 确认真实昵称, 拒绝坏号
   3. 合并写入 pool.json:
      - gateway_key 缺失 → 自动生成随机串并提示 (客户端拿它当 api_key)
@@ -58,6 +58,48 @@ def _read_pool_or_fallback() -> tuple[dict, list[str], str]:
         except (OSError, json.JSONDecodeError):
             pass
     return {}, [], "无 (新建)"
+
+
+def _read_masked(prompt: str) -> str:
+    """Windows 控制台逐字符读入: 每敲一个键回显一个 *, 退格可删, 回车提交。
+
+    getpass 全程无回显, 粘贴长 PAT 时窗口毫无动静, 会误以为没输进去。
+    用 msvcrt.getwch (noecho 版) 自己打星号: 有长度反馈, 又不把 PAT 亮在屏幕上。
+    """
+    import msvcrt
+
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    chars: list[str] = []
+    while True:
+        ch = msvcrt.getwch()
+        if ch in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "".join(chars)
+        if ch == "\x03":  # Ctrl+C
+            raise KeyboardInterrupt
+        if ch == "\x1a":  # Ctrl+Z
+            raise EOFError
+        if ch in ("\x00", "\xe0"):  # 方向键/功能键前缀: 吞掉跟随键, 不算内容
+            msvcrt.getwch()
+            continue
+        if ch == "\x08":  # Backspace
+            if chars:
+                chars.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+        chars.append(ch)
+        sys.stdout.write("*")
+        sys.stdout.flush()
+
+
+def _prompt_pat() -> str:
+    prompt = "> 请粘贴 PAT (pt- 开头, 逐字显示为*; 直接回车结束): "
+    if os.name == "nt":
+        return _read_masked(prompt)
+    return getpass.getpass(prompt)
 
 
 def verify_pat(pat: str) -> str:
@@ -138,7 +180,7 @@ def main() -> None:
             return
         while True:
             try:
-                pat = getpass.getpass("> 请粘贴 PAT (pt- 开头, 输入不回显; 直接回车结束): ").strip()
+                pat = _prompt_pat().strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 return

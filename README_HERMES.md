@@ -155,7 +155,7 @@ custom_providers:
 
 对标 workbuddy2api 的 login-helper 交互。双击运行（或在 cmd 里带参数 `add-pat.cmd pt-xxx ...`）：
 
-1. 命令窗口粘贴 PAT（输入不回显，不落日志）
+1. 命令窗口粘贴 PAT（逐字回显 `*` 打码，不落日志）
 2. 立即向 Qoder 网关验证（jobToken 冷交换确认真实昵称，坏号/格式错当场拒绝，绝不写入）
 3. 合并写入 `pool.json`；首次使用自动生成随机 `gateway_key` 并在窗口打印
 4. 若只有 `checkin.json` 旧配置，其中 PAT 自动并入 pool.json（一次性迁移）
