@@ -1,0 +1,14 @@
+{
+  "gateway_key": "CHANGE-ME-random-string",
+  "pats": [
+    "pt-第一个账号的PAT",
+    "pt-第二个账号的PAT"
+  ],
+  "options": {
+    "sticky_ttl_minutes": 30,
+    "auth_fail_threshold": 2,
+    "cooldown_minutes": 15,
+    "cooldown_max_minutes": 360,
+    "quota_cooldown_minutes": 360
+  }
+}

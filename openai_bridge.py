@@ -22,6 +22,7 @@ import time
 import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+import account_pool as pool_mod
 import checkin
 import qoder_auth
 from qoder_auth import AuthIdentity
@@ -317,7 +318,9 @@ class OpenAiBridge:
                     print(f"[bridge] reactive refresh failed: {rf}")
                     raise
 
-    async def handle_chat(self, req_body: dict):
+    async def handle_chat(self, req_body: dict, on_error=None, on_success=None):
+        # on_error/on_success: 账号池故障上报与恢复回调 (pool 模式注入)。
+        # 流式在 producer 错误/正常收尾分支调用; 直通模式为 None 保持零行为变化。
         # Proactively rotate the 24h session token before it expires so the
         # same PAT keeps working across day boundaries (scheme B).
         await self.ensure_fresh_session()
@@ -387,15 +390,26 @@ class OpenAiBridge:
         created = time.time_ns() // 1_000_000_000
 
         if stream:
-            return await self._handle_stream(
+            resp = await self._handle_stream(
+                body, url, extra_headers, req_id, created, openai_model, tools_enabled,
+                on_error=on_error, on_success=on_success,
+            )
+            return resp
+        try:
+            out = await self._handle_sync(
                 body, url, extra_headers, req_id, created, openai_model, tools_enabled
             )
-        return await self._handle_sync(
-            body, url, extra_headers, req_id, created, openai_model, tools_enabled
-        )
+        except Exception as e:
+            if on_error is not None:
+                on_error(e)
+            raise
+        if on_success is not None:
+            on_success()
+        return out
 
     async def _handle_stream(
-        self, body, url, extra_headers, req_id, created, model, tools_enabled
+        self, body, url, extra_headers, req_id, created, model, tools_enabled,
+        on_error=None, on_success=None,
     ) -> StreamingResponse:
         aq: asyncio.Queue[str | None] = asyncio.Queue()
         acc = StreamAccumulator(
@@ -435,9 +449,14 @@ class OpenAiBridge:
                     await aq.put(
                         f"data: {json.dumps(usage_chunk, ensure_ascii=False)}\n\n"
                     )
+                # 流正常收尾 (客户端中途断连被取消时不会走到这里, 不误报成功)
+                if on_success is not None:
+                    on_success()
             except Exception as e:
                 # 必须把错误暴露给客户端,否则 OpenAI 兼容客户端会把截断的流当成正常结束。
                 print(f"[bridge] stream error: {e}")
+                if on_error is not None:
+                    on_error(e)
                 try:
                     err_chunk = _make_chunk(req_id, created, model)
                     err_chunk["choices"][0]["finish_reason"] = "error"
@@ -607,6 +626,78 @@ class BridgeRegistry:
 
 _registry: BridgeRegistry | None = None
 
+# 多账号池 (单进程单例; 配置来自 pool.json / 环境变量, 详见 pool.py)
+_pool: pool_mod.AccountPool | None = None
+
+
+def get_pool() -> pool_mod.AccountPool | None:
+    return _pool
+
+
+def _get_or_create_bridge(raw_pat: str) -> OpenAiBridge:
+    """PAT → Bridge (经共享注册表, 与直通模式复用同一实例)。"""
+    real_pat, region = qoder_auth.resolve(raw_pat)
+    registry = _registry
+    if registry is None:
+        raise RuntimeError("bridge registry not initialized")
+    bridge = registry.get_or_create(real_pat, region)
+    # 昵称回填 (仅首次 bootstrap 后有意义; 幂等, 未 bootstrap 时静默)
+    identity = getattr(bridge, "identity", None)
+    name = getattr(identity, "name", "") if identity is not None else ""
+    p = _pool
+    if p is not None and name:
+        p.set_label(real_pat, name)
+    return bridge
+
+
+async def _account_for_pat(raw_pat: str) -> OpenAiBridge:
+    """取一个账号并保证会话就绪; 成功后顺带把昵称写进池。"""
+    bridge = _get_or_create_bridge(raw_pat)
+    await bridge.ensure_fresh_session()
+    identity = getattr(bridge, "identity", None)
+    name = getattr(identity, "name", "") if identity is not None else ""
+    p = _pool
+    if p is not None and name:
+        p.set_label(qoder_auth.resolve(raw_pat)[0], name)
+    return bridge
+
+
+def _pool_report_failure(pat: str, err: Exception) -> None:
+    """把请求失败汇报进池状态机 (忙/排队与客户端错误不算账号过错)。"""
+    p = _pool
+    if p is None:
+        return
+    if isinstance(err, qoder_auth.QoderBusyError) or isinstance(err, ValueError):
+        return
+    p.mark_failure(pat, err)
+
+
+async def _pool_quota_refresher():
+    """周期性巡检账号池余额/配额 (user_status), 把耗尽的号摘出选号池。
+
+    单轮内顺序处理, 每账号失败只记日志不中断整轮; 周期由常量控制。
+    """
+    import asyncio as _a
+
+    p = _pool
+    while p is not None and p.enabled:
+        for pat in p.pats():
+            try:
+                bridge = await _account_for_pat(pat)
+                status = await qoder_auth.user_status(
+                    bridge.identity.uid,
+                    bridge.machine_id,
+                    bridge.machine_token,
+                    bridge.machine_type,
+                    region=bridge.region,
+                )
+                p.apply_quota_status(pat, status if isinstance(status, dict) else {})
+            except _a.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 巡检失败不影响主链路
+                print(f"[pool] quota check pt-...{pat[-4:]} failed: {e}")
+        await _a.sleep(pool_mod._STATUS_REFRESH_INTERVAL_SEC)
+
 
 def _get_setting(key: str) -> str | None:
     return os.environ.get(key)
@@ -641,18 +732,34 @@ async def _lifespan(app: FastAPI):
     - 服务关闭时取消任务，避免悬挂
     """
     task = checkin.start_background_task(bridge_factory=OpenAiBridge)
+    quota_task = None
+    if _pool is not None and _pool.enabled:
+        quota_task = asyncio.create_task(
+            _pool_quota_refresher(), name="qoder-pool-quota-check"
+        )
     try:
         yield
     finally:
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        for t in (task, quota_task):
+            if t is not None and not t.done():
+                t.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await t
 
 
 def create_app() -> FastAPI:
-    global _registry
+    global _registry, _pool
     _registry = BridgeRegistry()
+    pool_settings = pool_mod.resolve_settings()
+    _pool = pool_mod.AccountPool(pool_settings)
+    if _pool.enabled:
+        print(
+            f"[pool] 账号池已启用: {len(pool_settings.pats)} 个账号"
+            f" (来源 {pool_settings.source or '无'}),"
+            f" 网关key={'已配置' if pool_settings.gateway_key else '未配置(仅直通)'}"
+        )
+    else:
+        print("[pool] 未配置账号池 (pool.json/QODER_POOL_PATS), 仅 PAT 直通模式")
 
     app = FastAPI(title="qoder2api", lifespan=_lifespan)
 
@@ -664,19 +771,60 @@ def create_app() -> FastAPI:
                 return JSONResponse(
                     {
                         "error": {
-                            "message": "Missing Authorization: Bearer <PAT>",
+                            "message": "Missing Authorization: Bearer ***",
                             "type": "invalid_request_error",
                         }
                     },
                     status_code=401,
                 )
-            real_pat, region = qoder_auth.resolve(raw_pat)
-            registry = _registry
-            if registry is None:
-                raise RuntimeError("bridge registry not initialized")
-            bridge = registry.get_or_create(real_pat, region)
             req_body = await request.json()
-            return await bridge.handle_chat(req_body)
+            p = _pool
+
+            # ── 双轨鉴权: pt- 前缀直通该账号; 网关 key 走账号池选号 ──
+            if raw_pat.startswith("pt-") or not (p is not None and p.gateway_enabled and p.is_gateway_key(raw_pat)):
+                bridge = _get_or_create_bridge(raw_pat)
+                return await bridge.handle_chat(req_body)
+
+            # 池模式: 粘性选号 → 同步阶段失败自动换号 (排除已试过的, 上限 3 次)
+            sticky = pool_mod.derive_sticky_key(req_body)
+            tried: set[str] = set()
+            last_error: Exception | None = None
+            for _ in range(pool_mod.MAX_ATTEMPTS_CAP):
+                pat = p.select(sticky, frozenset(tried))
+                if pat is None:
+                    break
+                tried.add(pat)
+                try:
+                    bridge = await _account_for_pat(pat)
+                except Exception as e:  # 冷交换/会话建立失败: 可换号重试
+                    _pool_report_failure(pat, e)
+                    last_error = e
+                    continue
+                try:
+                    return await bridge.handle_chat(
+                        req_body,
+                        on_error=lambda err: _pool_report_failure(pat, err),
+                        on_success=lambda: p.mark_success(pat, sticky),
+                    )
+                except (ValueError, qoder_auth.QoderBusyError):
+                    # 客户端错误(模型不支持等)与上游忙/排队: 换号无意义, 原样上抛
+                    raise
+                except Exception as e:
+                    # 会话已就绪但请求失败 (auth/网络): 记失败并换下一号
+                    _pool_report_failure(pat, e)
+                    last_error = e
+                    continue
+            if last_error is not None:
+                raise last_error
+            return JSONResponse(
+                {
+                    "error": {
+                        "message": "No healthy account available in pool",
+                        "type": "pool_exhausted",
+                    }
+                },
+                status_code=503,
+            )
         except ValueError as e:
             return JSONResponse(
                 {"error": {"message": str(e), "type": "invalid_request_error"}},
@@ -700,18 +848,41 @@ def create_app() -> FastAPI:
                 status_code=500,
             )
 
+    @app.get("/status")
+    async def status():
+        # 账号池观测端点: 脱敏状态 (无 PAT 明文), 供运维排查与 status.cmd 消费。
+        p = _pool
+        registry = _registry
+        return {
+            "pool": {
+                "enabled": bool(p is not None and p.enabled),
+                "gateway_key_configured": bool(p is not None and p.settings.gateway_key),
+                "source": p.settings.source if p is not None else "",
+                "accounts": p.snapshot() if p is not None else [],
+            },
+            "bridges_active": len(registry._bridges) if registry is not None else 0,
+        }
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         # 带 PAT 则返回该账户动态拉取的目录; 无 PAT 回退内置表。
         raw_pat = _extract_pat_from_request(request)
         if raw_pat:
             try:
-                real_pat, region = qoder_auth.resolve(raw_pat)
-                registry = _registry
-                if registry is None:
-                    raise RuntimeError("bridge registry not initialized")
-                bridge = registry.get_or_create(real_pat, region)
-                return models.models_payload(await bridge.get_catalog())
+                p = _pool
+                if (
+                    p is not None
+                    and p.gateway_enabled
+                    and not raw_pat.startswith("pt-")
+                    and p.is_gateway_key(raw_pat)
+                ):
+                    # 网关 key: 任选一个健康账号拉目录 (各账号目录一致)
+                    pat = p.select("", frozenset())
+                    bridge = await _account_for_pat(pat) if pat else None
+                else:
+                    bridge = _get_or_create_bridge(raw_pat)
+                if bridge is not None:
+                    return models.models_payload(await bridge.get_catalog())
             except Exception as e:
                 print(f"[models] WARN /v1/models dynamic failed ({e!r}); fallback")
         return models.models_payload()

@@ -104,3 +104,49 @@ custom_providers:
 - 真正的登录过期（`code 105` / 401 / 403 无忙标记）仍照旧刷新会话重试一次
 
 实现：`qoder_auth.QoderBusyError` + `detect_upstream_busy()`（分类 + 多层信封下钻），桥接层负责状态码映射。
+
+---
+
+## 8. 多账号池（一个服务管理多个 Qoder 账号）
+
+参考 workbuddy2api 的账号池模式。客户端**双轨鉴权**：
+
+- Bearer 以 `pt-` 开头 → 直通该 PAT 账号（旧行为，Hermes 现有配置零改动）
+- Bearer 为配置的 `gateway_key` → 服务端从账号池选号，客户端只需一把网关钥匙
+
+### 配置（pool.json，模板见 pool.json.example）
+
+```json
+{
+  "gateway_key": "随便一长串随机字符串",
+  "pats": ["pt-账号一", "pt-账号二"],
+  "options": {
+    "sticky_ttl_minutes": 30,
+    "auth_fail_threshold": 2,
+    "cooldown_minutes": 15,
+    "cooldown_max_minutes": 360,
+    "quota_cooldown_minutes": 360
+  }
+}
+```
+
+环境变量优先：`QODER_GATEWAY_KEY`、`QODER_POOL_PATS`（逗号分隔）。
+无 pool.json 时回退读 checkin.json 的 pat/pats（旧部署兼容）；两处都没有 = 纯直通模式。
+
+### 选号与故障治理
+
+- 会话粘性：同一对话（conversation_id / prompt_cache_key / 首条 user 消息哈希）固定同一账号，30 分钟滚动续期，保证多轮上下文与上游 prompt cache 不跳号
+- 无粘性键时按最近最少使用（LRU）均摊流量
+- 同步阶段（冷交换/建会话）失败 → 自动换号重试，单请求上限 3 次
+- 连续鉴权失败达到阈值 → 指数退避冷却（15 分钟起、翻倍、封顶 6 小时），成功一次清零
+- 每日 30 分钟周期巡检 `user_status`：`isQuotaExceeded` 的号硬冷却到 `nextResetAt`，恢复后自动回池
+- 上游忙/排队（10605）与模型不支持等客户端错误**不计入账号过错**（换号无意义，原样上抛）
+- 全池冷却时仍临时放行最早恢复的账号，不拒绝服务
+
+### 观测
+
+`GET /status` 返回各账号脱敏状态（昵称/尾号、ok|cooldown|quota_exceeded、冷却剩余、连续失败数、quota、nextResetAt），不含 PAT 明文。
+
+### 签到与池共用账号
+
+每日 100 Credits 签到任务照常逐个 PAT 领取（配置来源同 pool.json/checkin.json 回退链）。
