@@ -173,6 +173,13 @@ def next_check_plan(outcomes: list["CheckinOutcome"], now: datetime, retry_secon
     """
     if outcomes and all(o.status in _SETTLED_STATUSES for o in outcomes):
         return seconds_until_next_window(now), "settled"
+    # 混态收口: 已过当天宽限的 skipped 视为尘埃落定 (账号未被投放活动, 再等多久也不会变),
+    # 否则 already+skipped 组合会掉进兜底分支每 30 分钟空转重试。
+    past_grace = now.astimezone(CST) >= _grace_deadline(now.astimezone(CST))
+    if outcomes and past_grace and all(
+        o.status in _SETTLED_STATUSES or o.status == "skipped" for o in outcomes
+    ):
+        return seconds_until_next_window(now), "give_up"
     if outcomes and all(o.status == "skipped" for o in outcomes):
         local = now.astimezone(CST)
         if local < _window_deadline(local):

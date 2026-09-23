@@ -286,6 +286,19 @@ class CheckinSchedulingTests(unittest.TestCase):
         late_night = datetime(2026, 9, 21, 23, 0, tzinfo=CST)
         self.assertEqual(checkin.next_check_plan(skipped, late_night, 1800), ((11 * 60 + 15) * 60, "give_up"))
 
+    def test_plan_already_plus_skipped_after_grace_gives_up(self):
+        # 回归: 主号已领(already) + 无入口号未投放(skipped) 混态, 过宽限后不得
+        # 每30分钟空转重试 —— 等一万年 skipped 也不会变, 必须睡到明天窗口
+        mixed = [checkin.CheckinOutcome("already"), checkin.CheckinOutcome("skipped")]
+        evening = datetime(2026, 9, 21, 19, 30, tzinfo=CST)
+        self.assertEqual(checkin.next_check_plan(mixed, evening, 1800), ((14 * 60 + 45) * 60, "give_up"))
+        # 宽限期内仍保留 30 分钟重试 (活动可能晚下发)
+        in_grace = datetime(2026, 9, 21, 11, 30, tzinfo=CST)
+        self.assertEqual(checkin.next_check_plan(mixed, in_grace, 1800), (1800, "retrying"))
+        # error 混态不放弃 (可自愈故障恢复后要补领)
+        with_error = [checkin.CheckinOutcome("already"), checkin.CheckinOutcome("error")]
+        self.assertEqual(checkin.next_check_plan(with_error, evening, 1800), (1800, "retrying"))
+
     def test_plan_errors_keep_retrying(self):
         # 网络/协议类故障不放弃（恢复后立即补领当天）
         late_night = datetime(2026, 9, 21, 23, 0, tzinfo=CST)
