@@ -161,12 +161,36 @@ class FailureStateTests(unittest.TestCase):
         with patch.object(openai_bridge, "_pool", p):
             openai_bridge._pool_report_failure(pat, qoder_auth.QoderBusyError("queued", 5))
             openai_bridge._pool_report_failure(pat, ValueError("Unsupported model"))
+            # 回归: 载荷超限/网关超时/网络超时均账号无关, 不得计入故障
+            import httpx
+
+            openai_bridge._pool_report_failure(pat, RuntimeError("HTTP 413 body=too large"))
+            openai_bridge._pool_report_failure(pat, RuntimeError("HTTP 504 Gateway Time-out"))
+            openai_bridge._pool_report_failure(pat, httpx.ReadTimeout(""))
+            openai_bridge._pool_report_failure(pat, httpx.ConnectError(""))
         self.assertEqual(p.snapshot()[0]["state"], "ok", "忙/客户端错误不应冷却账号")
         with patch.object(openai_bridge, "_pool", p):
             openai_bridge._pool_report_failure(
                 pat, RuntimeError("HTTP 401 unauthorized")
             )
         self.assertGreaterEqual(p.snapshot()[0]["auth_fails"], 0)
+
+    def test_success_clears_generic_cooldown(self):
+        # 回归: generic 冷却期间请求成功 (200 即号活着的证据), 必须立即作废冷却。
+        # 旧行为只有 quota_exceeded 分支清 disabled_until, 误判号持续成功仍被
+        # 每请求刷"临时放行" WARN, 直到墙上时钟走完冷却期。
+        clock = FakeClock()
+        p = make_pool(1, clock)
+        pat = p.pats()[0]
+        for _ in range(4):  # 攒满 generic 阈值 (auth_fail_threshold*2), 进入冷却
+            p.mark_failure(pat, RuntimeError("HTTP 500 boom"))
+        self.assertGreater(p.snapshot()[0]["cooldown_remaining_sec"], 0, "前置: 应已冷却")
+        p.mark_success(pat, "")
+        snap = p.snapshot()[0]
+        self.assertEqual(snap["state"], "ok")
+        self.assertEqual(snap["cooldown_remaining_sec"], 0)
+        # 选号不再走"全冷却兜底" (兜底会刷 WARN, 这里应静默命中健康池)
+        self.assertEqual(p.select("k1"), pat)
 
     def test_quota_exceeded_cooldown_with_reset_time(self):
         clock = FakeClock()

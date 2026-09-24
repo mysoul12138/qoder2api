@@ -670,11 +670,25 @@ async def _account_for_pat(raw_pat: str) -> OpenAiBridge:
 
 
 def _pool_report_failure(pat: str, err: Exception) -> None:
-    """把请求失败汇报进池状态机 (忙/排队与客户端错误不算账号过错)。"""
+    """把请求失败汇报进池状态机 (忙/排队与客户端错误不算账号过错)。
+
+    载荷超限 (HTTP 413)、网关超时 (HTTP 504)、网络超时同样是账号无关的:
+    超大请求换任何号都会挂, 记到账号头上会误伤健康池 (曾导致整池空转 WARN)。
+    """
     p = _pool
     if p is None:
         return
     if isinstance(err, qoder_auth.QoderBusyError) or isinstance(err, ValueError):
+        return
+    import httpx
+
+    # httpx 超时/网络中断类异常 str() 常为空串, 只能按类型判 (账号无关)
+    if isinstance(err, (httpx.TimeoutException, httpx.TransportError)):
+        print(f"[pool] pt-...{pat[-4:]} 网络超时/中断, 不计账号故障")
+        return
+    msg = str(err)
+    if any(m in msg for m in ("HTTP 413", "HTTP 504")):
+        print(f"[pool] pt-...{pat[-4:]} 账号无关错误 (超限/网关超时), 不计故障")
         return
     p.mark_failure(pat, err)
 

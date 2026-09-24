@@ -351,8 +351,11 @@ class AccountPool:
             if acc.quota_exceeded:
                 # 还能成功说明已恢复 (充值/重置), 解除配额冷却
                 acc.quota_exceeded = False
-                acc.disabled_until = 0.0
                 print(f"[pool] pt-...{acc.tail} 请求成功, 解除配额冷却")
+            # 200 即证明号活着: 任何冷却 (含 generic 计时冷却) 一律作废。
+            # 此前只有 quota_exceeded 分支清 disabled_until, 导致误判冷却的号
+            # 即使持续成功仍被每请求刷"临时放行" WARN, 直到墙上时钟走完。
+            acc.disabled_until = 0.0
             if sticky_key:
                 self._bind_locked(sticky_key, pat, now)
 
