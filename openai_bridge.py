@@ -355,6 +355,19 @@ class OpenAiBridge:
         if effort is not None:
             print(f"[bridge] reasoning effort: {req_body.get('reasoning_effort')!r} -> {effort}")
 
+        # 视频适配: 上游不消费视频 part (黑盒实测: image 能看见, video_url/
+        # file/顶层 video 全被无视)。最新一条用户消息的 video_url 先抽帧成
+        # image parts, 再进 prompt 提取与消息构造 —— 保证 vision 门控和
+        # 最终请求体看到的是同一套帧图。历史消息不重抽 (只有最新一条展开)。
+        try:
+            import video_frames
+
+            messages, vstats = await video_frames.expand_videos_in_messages(messages)
+        except video_frames.VideoFramesUnavailable as exc:
+            raise RuntimeError(f"video input unavailable: {exc}") from exc
+        if vstats:
+            print(f"[bridge] video frames: {vstats}")
+
         prompt = _extract_latest_user_prompt(messages)
         body["chat_context"]["text"]["text"] = prompt
         body["chat_context"]["extra"]["originalContent"]["text"] = prompt
@@ -715,6 +728,12 @@ def _pool_report_failure(pat: str, err: Exception) -> None:
     msg = str(err)
     if any(m in msg for m in ("HTTP 413", "HTTP 504")):
         print(f"[pool] pt-...{pat[-4:]} 账号无关错误 (超限/网关超时), 不计故障")
+        return
+    # 巨体请求被网关边缘以 400 弹回 (2026-09-24 实测: 27MB → HTTP 400):
+    # 与 413 同类属载荷问题; 小请求的 400 是真参数错误, 照常记账。
+    request_chars = getattr(err, "_qoder_request_chars", 0) or 0
+    if "HTTP 400" in msg and request_chars >= 1_500_000:
+        print(f"[pool] pt-...{pat[-4:]} 载荷过大 (HTTP 400), 不计账号故障")
         return
     p.mark_failure(pat, err)
 

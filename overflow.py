@@ -152,6 +152,11 @@ def translate_upstream_error(err_text: str, request_chars: int) -> dict | None:
             or "http 413" in low or "error code: 413" in low):
         return make_overflow_error(request_chars, DEFAULT_INPUT_CEILING,
                                    "gateway reported payload too large")
+    # 巨体请求被网关边缘以 400 拒绝 (2026-09-24 实测: 27MB 请求体 → HTTP 400)。
+    # 小请求的 400 是参数问题不往这里凑。
+    if "http 400" in low and request_chars >= _TIMEOUT_AS_OVERFLOW_CHARS:
+        return make_overflow_error(request_chars, DEFAULT_INPUT_CEILING,
+                                   "gateway rejected oversized request (HTTP 400)")
     if ("http 504" in low or "timed out" in low or "timeout" in low) and \
             request_chars >= _TIMEOUT_AS_OVERFLOW_CHARS:
         return make_overflow_error(
