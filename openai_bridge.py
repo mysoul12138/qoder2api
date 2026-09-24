@@ -357,14 +357,12 @@ class OpenAiBridge:
 
         # 视频适配: 上游不消费视频 part (黑盒实测: image 能看见, video_url/
         # file/顶层 video 全被无视)。最新一条用户消息的 video_url 先抽帧成
-        # image parts, 再进 prompt 提取与消息构造 —— 保证 vision 门控和
-        # 最终请求体看到的是同一套帧图。历史消息不重抽 (只有最新一条展开)。
-        try:
-            import video_frames
+        # image parts 再进 prompt 提取 —— 保证 vision 门控和最终请求体看到的是
+        # 同一套帧图。ffmpeg 缺失/解码失败在 expand 内部降级为文字提示,
+        # 请求照常继续 (不抛错、绝不回退 base64 文本)。
+        import video_frames
 
-            messages, vstats = await video_frames.expand_videos_in_messages(messages)
-        except video_frames.VideoFramesUnavailable as exc:
-            raise RuntimeError(f"video input unavailable: {exc}") from exc
+        messages, vstats = await video_frames.expand_videos_in_messages(messages)
         if vstats:
             print(f"[bridge] video frames: {vstats}")
 
