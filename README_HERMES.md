@@ -196,3 +196,18 @@ Hermes 侧 `agent.reasoning_effort` 经 custom profile 钳到 OpenAI 兼容集�
 3. **流内错误显式化**：上游会在 HTTP 200 的流里塞错误信封（旧行为被当空 delta 吞掉，客户端拿到假的"正常空回复"），现在识别信封结构（statusCode/headers 键 + 内层无 choices）并显式抛错转译；正常回复文本含 `provider_error` 字样不误伤
 
 超限/超时同时不计入账号故障（与 busy、不支持模型同类）。客户端侧建议：单条请求字符数控制在 1M 以内，大素材分段发。
+
+## 11. 视频输入适配（video_frames.py）
+
+黑盒实测（三种视频 part 结构 + 真图对照）：Qoder 上游 chat 协议**只消费 image part**——`video_url`/`file`/顶层 `video` 全被静默无视；旧链路把视频 JSON dump 进消息文本，模型只能"逐字背 base64"（会谈 ftyp/hdlr 容器头，看不见画面），且 27MB 载荷直接顶爆 983,616 token 上限。
+
+桥的解法：收到 `video_url` part 时用本机 **ffmpeg 抽帧**成按时间序的 JPEG 序列，以多图 image parts 发给视觉模型（上游 image 通道实测有效——testsrc 测试视频端到端验证，模型正确描述了彩虹滚动条、旋转圆和倒计时数字）。只保画面不保音频。
+
+规则：
+- 只展开**最新一条**含视频的消息；历史视频换成文字占位符（多轮会话不再重复背整段 base64）
+- 帧数/尺寸/预算可调（env）：`QODER_VIDEO_FPS`（默认 1）、`QODER_VIDEO_MAX_FRAMES`（默认 48）、`QODER_VIDEO_LONG_SIDE`（默认 1024）、`QODER_VIDEO_MAX_BYTES`（帧总预算，默认 8MB）
+- 无 ffmpeg / 解码失败 → 显式报错，**绝不**静默回退成 base64 文本
+- 仅支持 base64 data URL，外链不代取（防 SSRF）
+- 抽帧发生在 prompt 提取与 vision 门控之前，预检估算器（只算文本）不会误杀视频流量
+
+前提：运行机器要有 ffmpeg（本机已有）。视频消息请显式选支持视觉的模型（Qwen3.8-Flash / Qwen3.7-Plus）。
