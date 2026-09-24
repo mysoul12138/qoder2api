@@ -56,15 +56,42 @@ def config() -> tuple[float, int, int]:
     )
 
 
+def probe_duration(video_bytes: bytes) -> float:
+    """ffprobe 测时长 (秒); 失败返回 0 (调用方退回头部截断行为)。"""
+    exe = shutil.which("ffprobe") or (ffmpeg_path() or "").replace("ffmpeg", "ffprobe")
+    if not exe or not os.path.exists(exe):
+        return 0.0
+    try:
+        r = subprocess.run(
+            [exe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", "-"],
+            input=video_bytes, capture_output=True, timeout=30)
+        return float(r.stdout.decode().strip())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def extract_frames(video_bytes: bytes, *, fps: float, max_frames: int,
-                   long_side: int) -> list[bytes]:
-    """同步抽帧 (调用方放 to_thread)。返回按时间序的 JPEG 字节列表。"""
+                   long_side: int) -> tuple[list[bytes], float]:
+    """同步抽帧 (调用方放 to_thread)。返回 (按时间序的 JPEG 列表, 实际生效 fps)。
+
+    均匀采样: 先测时长, 帧预算平均摊到全片 (fps_eff = min(fps, max_frames/时长)),
+    保证 3 分钟视频的结尾与前 1 分钟有同等覆盖 —— 旧版 `-frames:v` 头部截断
+    会让后半段整段消失 (2026-09-24 实测 203s 视频只读到前 ~1:40)。
+    ffprobe 不可用/解析失败时退回原头部截断行为并提示。
+    """
     exe = ffmpeg_path()
     if not exe:
         raise VideoFramesUnavailable("本机未安装 ffmpeg, 无法抽帧")
     fps = max(0.1, min(fps, 4.0))
     max_frames = max(1, min(max_frames, 120))
     long_side = max(256, min(long_side, 1920))
+    duration = probe_duration(video_bytes)
+    if duration > 0:
+        eff_fps = min(fps, max_frames / duration)
+    else:
+        eff_fps = fps
+        print("[video_frames] WARN 时长探测失败, 退回头部截断采样")
     with tempfile.TemporaryDirectory(prefix="qoder2api-vid-") as td:
         src = os.path.join(td, "in.mp4")
         with open(src, "wb") as f:
@@ -72,7 +99,7 @@ def extract_frames(video_bytes: bytes, *, fps: float, max_frames: int,
         # scale 长边不超 long_side (宽=if(gte(iw,ih),L,-2) 形式保证奇数且保持比例);
         # -2 让另一边自动按比例取偶数
         vf = (
-            f"fps={fps},"
+            f"fps={eff_fps:.6g},"
             f"scale='if(gte(iw,ih),min({long_side},iw),-2)':"
             f"'if(gte(iw,ih),-2,min({long_side},ih))'"
         )
@@ -93,7 +120,7 @@ def extract_frames(video_bytes: bytes, *, fps: float, max_frames: int,
                 frames.append(f.read())
         if not frames:
             raise VideoFramesUnavailable("ffmpeg 未产出任何帧 (视频可能损坏)")
-        return frames
+        return frames, eff_fps
 
 
 def data_url_to_bytes(data_url: str) -> bytes:
@@ -138,6 +165,24 @@ def _frame_budget_bytes() -> int:
         return 8_000_000
 
 
+def _budget_subsample(frames: list[bytes], budget: int) -> list[bytes]:
+    """帧总字节超预算时均匀跳采 (保首帧与时间覆盖), 而不是头部截断。
+
+    例: 48 帧共 12MB / 预算 8MB → 隔 1 取 1 得 24 帧, 全片覆盖不变。
+    至少保留 1 帧 (取正中间那张, 比第一张更可能有代表性信息)。
+    """
+    total = sum(len(f) for f in frames)
+    if total <= budget or len(frames) <= 1:
+        return frames
+    import math
+
+    step = math.ceil(total / budget)  # 每 step 张取 1 张即可入预算
+    kept = frames[::step]
+    if not kept:  # 理论不可达 (step 有限), 兜底中间帧
+        kept = [frames[len(frames) // 2]]
+    return kept
+
+
 async def expand_videos_in_messages(messages: list) -> tuple[list, dict | None]:
     """把最新一条含视频的用户消息抽帧成 image parts; 更早的视频换成文字占位。
 
@@ -178,7 +223,6 @@ async def expand_videos_in_messages(messages: list) -> tuple[list, dict | None]:
             continue
         parts = m.get("content")
         new_parts: list = []
-        used_bytes = 0
         for p in parts:
             url = _part_video_url(p) if isinstance(p, dict) else None
             if url is None:
@@ -186,24 +230,23 @@ async def expand_videos_in_messages(messages: list) -> tuple[list, dict | None]:
                 continue
             stats["videos"] += 1
             raw = data_url_to_bytes(url)
-            frames = await asyncio.to_thread(
+            frames, eff_fps = await asyncio.to_thread(
                 extract_frames, raw, fps=fps, max_frames=max_frames,
                 long_side=long_side)
-            kept = []
-            for img in frames:
-                if used_bytes + len(img) > budget and kept:
-                    break  # 超预算截断 (保时间序前段; 至少保 1 帧)
-                used_bytes += len(img)
-                kept.append(img)
-            stats["frames"] += len(kept)
+            frames = _budget_subsample(frames, budget)
+            stats["frames"] += len(frames)
+            stats["eff_fps"] = round(eff_fps, 4)
             new_parts.append({
                 "type": "text",
                 "text": (
-                    f"[以下是视频按每秒 {fps:g} 帧抽取的 {len(kept)} 张连续画面, "
+                    f"[以下是视频全片均匀抽样的 {len(frames)} 张画面, "
+                    f"按时间先后排列 (约每 {1/eff_fps:.0f} 秒一帧)]"
+                    if eff_fps < 1 else
+                    f"[以下是视频按每秒 {fps:g} 帧抽取的 {len(frames)} 张连续画面, "
                     "按时间先后排列]"
                 ),
             })
-            for img in kept:
+            for img in frames:
                 new_parts.append({
                     "type": "image_url",
                     "image_url": {
@@ -235,18 +278,4 @@ def _strip_history_videos(message: dict, stats: dict) -> dict:
     return m2
 
 
-def videos_to_frame_data_urls(video_data_urls: list[str]) -> tuple[list[str], dict]:
-    """批量抽帧 → (帧 image data URL 列表按视频先后+时间序拼接, 统计信息)。"""
-    fps, max_frames, long_side = config()
-    all_frames: list[str] = []
-    stats = {"videos": len(video_data_urls), "frames": 0, "fps": fps,
-             "long_side": long_side}
-    for u in video_data_urls:
-        raw = data_url_to_bytes(u)
-        per_video_cap = max(1, max_frames // max(1, len(video_data_urls)))
-        frames = extract_frames(raw, fps=fps, max_frames=per_video_cap,
-                                long_side=long_side)
-        for img in frames:
-            all_frames.append("data:image/jpeg;base64," + base64.b64encode(img).decode())
-    stats["frames"] = len(all_frames)
-    return all_frames, stats
+
