@@ -181,6 +181,30 @@ class FailureStateTests(unittest.TestCase):
         self.assertEqual(snap["quota"], 0)
         self.assertEqual(snap["next_reset_at"], future_ms)
 
+    def test_quota_exceeded_log_only_on_transition(self):
+        # 回归: 持续耗尽每30分钟巡检一次, "配额耗尽"日志不得每轮刷屏;
+        # 状态翻转 (恢复→再耗尽) 时才重新打印
+        import io
+        from contextlib import redirect_stdout
+        clock = FakeClock()
+        p = make_pool(1, clock)
+        pat = p.pats()[0]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            p.apply_quota_status(pat, {"isQuotaExceeded": True, "quota": 0})
+            first = buf.getvalue()
+            p.apply_quota_status(pat, {"isQuotaExceeded": True, "quota": 0})  # 巡检再来
+            second = buf.getvalue()
+        self.assertIn("配额耗尽", first)
+        self.assertEqual(first, second, "持续耗尽不应重复打印")
+        base = buf.getvalue().count("配额耗尽")
+        with redirect_stdout(buf):
+            p.mark_success(pat, "")  # 充值恢复
+            p.apply_quota_status(pat, {"isQuotaExceeded": True, "quota": 0})
+        self.assertEqual(
+            buf.getvalue().count("配额耗尽") - base, 1, "恢复后再次耗尽应重新打印"
+        )
+
     def test_gateway_key_constant_time_compare(self):
         p = make_pool(2)
         self.assertTrue(p.is_gateway_key(GATEWAY_KEY))

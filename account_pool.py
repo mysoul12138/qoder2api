@@ -408,6 +408,7 @@ class AccountPool:
                 return
             acc.quota = status.get("quota")
             acc.next_reset_at = reset_ms
+            was_exceeded = acc.quota_exceeded
             if not exceeded:
                 acc.quota_exceeded = False
                 return
@@ -420,9 +421,12 @@ class AccountPool:
                 acc.disabled_until = max(
                     acc.disabled_until, now + self._s.quota_cooldown_sec
                 )
-            print(
-                f"[pool] pt-...{acc.tail} 配额耗尽, 冷却至 {int(acc.disabled_until - now) // 60} 分钟后"
-            )
+            # 只在"刚进入耗尽态"时打一次; 持续耗尽 (每30分钟巡检一次都撞上)
+            # 不重复刷屏 —— 数字每轮 -30 曾被误读成"反复冷却"。
+            if not was_exceeded:
+                print(
+                    f"[pool] pt-...{acc.tail} 配额耗尽, 冷却至 {int(acc.disabled_until - now) // 60} 分钟后"
+                )
 
     # ── 观测 ────────────────────────────────────────────────
     def snapshot(self) -> list[dict]:
