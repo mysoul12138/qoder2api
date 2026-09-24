@@ -27,6 +27,7 @@ import checkin
 import qoder_auth
 from qoder_auth import AuthIdentity
 import models
+import overflow
 import reasoning
 import usage
 from transform import (
@@ -395,11 +396,13 @@ class OpenAiBridge:
 
         req_id = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = time.time_ns() // 1_000_000_000
+        # 超限翻译上下文: 请求 messages 序列化字符数 (504 归因判据)
+        request_chars = len(json.dumps(messages, ensure_ascii=False))
 
         if stream:
             resp = await self._handle_stream(
                 body, url, extra_headers, req_id, created, openai_model, tools_enabled,
-                on_error=on_error, on_success=on_success,
+                on_error=on_error, on_success=on_success, request_chars=request_chars,
             )
             return resp
         try:
@@ -407,6 +410,11 @@ class OpenAiBridge:
                 body, url, extra_headers, req_id, created, openai_model, tools_enabled
             )
         except Exception as e:
+            # 挂载请求体积供路由层 overflow 翻译归因 (504 只有巨体才判溢出)
+            try:
+                e._qoder_request_chars = request_chars
+            except Exception:
+                pass
             if on_error is not None:
                 on_error(e)
             raise
@@ -416,7 +424,7 @@ class OpenAiBridge:
 
     async def _handle_stream(
         self, body, url, extra_headers, req_id, created, model, tools_enabled,
-        on_error=None, on_success=None,
+        on_error=None, on_success=None, request_chars=0,
     ) -> StreamingResponse:
         aq: asyncio.Queue[str | None] = asyncio.Queue()
         acc = StreamAccumulator(
@@ -430,6 +438,13 @@ class OpenAiBridge:
                     if not line.startswith("data:"):
                         continue
                     payload = line[5:].strip()
+                    if overflow.stream_error_payload(payload):
+                        # 上游在 200 流里塞错误信封 (典型: 413 Range of input length)
+                        # —— 旧行为是当空 delta 吞掉, 客户端拿到假"正常空回复";
+                        # 现在显式抛错, 走 except 翻译成标准溢出错误。
+                        # 截 2000: 413 信封的关键 Range 文本在多层转义后约 300 字符处,
+                        # 太短会截掉 Range 导致翻译器丢锚点。
+                        raise RuntimeError(f"upstream stream error: {payload[:2000]}")
                     delta = _extract_delta(payload)
                     if not delta.is_empty():
                         acc.accept(delta)
@@ -468,15 +483,19 @@ class OpenAiBridge:
                     err_chunk = _make_chunk(req_id, created, model)
                     err_chunk["choices"][0]["finish_reason"] = "error"
                     err_chunk["choices"][0]["delta"] = {}
-                    err_chunk["error"] = {
-                        "message": str(e),
-                        # 上游忙/排队单列一类: 客户端可据此退避重试, 而不是当鉴权失败
-                        "type": (
-                            "upstream_busy"
-                            if isinstance(e, qoder_auth.QoderBusyError)
-                            else "qoder_error"
-                        ),
-                    }
+                    translated = overflow.translate_upstream_error(str(e), request_chars)
+                    if translated is not None:
+                        err_chunk["error"] = translated["error"]
+                    else:
+                        err_chunk["error"] = {
+                            "message": str(e),
+                            # 上游忙/排队单列一类: 客户端可据此退避重试, 而不是当鉴权失败
+                            "type": (
+                                "upstream_busy"
+                                if isinstance(e, qoder_auth.QoderBusyError)
+                                else "qoder_error"
+                            ),
+                        }
                     await aq.put(
                         f"data: {json.dumps(err_chunk, ensure_ascii=False)}\n\n"
                     )
@@ -506,6 +525,13 @@ class OpenAiBridge:
             if not line.startswith("data:"):
                 continue
             payload = line[5:].strip()
+            if overflow.stream_error_payload(payload):
+                # 上游在 200 流里塞错误信封 (典型: 413 Range of input length)
+                # —— 旧行为是当空 delta 吞掉, 客户端拿到假"正常空回复";
+                # 现在显式抛错, 走 except 翻译成标准溢出错误。
+                # 截 2000: 413 信封的关键 Range 文本在多层转义后约 300 字符处,
+                # 太短会截掉 Range 导致翻译器丢锚点。
+                raise RuntimeError(f"upstream stream error: {payload[:2000]}")
             delta = _extract_delta(payload)
             if delta.reasoning_content:
                 full_reasoning_content.append(delta.reasoning_content)
@@ -810,6 +836,11 @@ def create_app() -> FastAPI:
                     status_code=401,
                 )
             req_body = await request.json()
+            # 发送前预检 (保守下界): 怎么算都超物理顶的直接回标准溢出错误,
+            # 省一次 5 分钟的上游往返; Hermes 分类器认 code 走压缩恢复。
+            pre = overflow.pre_reject_error(req_body.get("messages", []))
+            if pre is not None:
+                return JSONResponse(pre, status_code=400)
             p = _pool
             if p is not None:
                 # 热加载: pool.json / checkin.json 被外部改过时增量合并 (2s 节流)
@@ -878,6 +909,12 @@ def create_app() -> FastAPI:
                 headers=headers,
             )
         except Exception as e:
+            # 上游 413/Range/巨体504 → 翻译成 OpenAI context_length_exceeded,
+            # Hermes 分类器命中后走压缩恢复而不是重试烧超时
+            translated = overflow.translate_upstream_error(
+                str(e), getattr(e, "_qoder_request_chars", 0))
+            if translated is not None:
+                return JSONResponse(translated, status_code=400)
             return JSONResponse(
                 {"error": {"message": str(e), "type": "qoder_error"}},
                 status_code=500,

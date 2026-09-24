@@ -182,3 +182,17 @@ custom_providers:
 Hermes 侧 `agent.reasoning_effort` 经 custom profile 钳到 OpenAI 兼容集后发出（如 ultra → 线上为 max → 本桥归一 xhigh）。
 
 真机实测：①档位——Qwen3.8-Flash 同题，low reasoning_tokens 4096（127s）↔ xhigh 11590（245s），约 2.8 倍；②关思考——Qwen3.7-Plus 陷阱题（9.11 vs 9.9），开思考 reasoning 422 字且答对，`enable_thinking:false` 后 reasoning 归零、耗时 4.7s→1.4s、答错——参数被真实执行而非忽略（`is_reasoning` 配 true/false 均不报错）。
+
+---
+
+## 10. 超大请求适配（overflow.py）
+
+背景：3.4MB 级请求（视频帧+长上下文）打到上游得到 413（`Range of input length should be [1, 983616]`，即 Flash 物理输入顶）或网关 504，上游原文措辞不在 Hermes 错误分类器的识别表里 → 客户端只会当普通 5xx 重试到烧完超时，永不触发压缩恢复。
+
+桥做三层适配：
+
+1. **发送前预检**：按最保守 token 下界（ASCII 4字符/token、CJK 1字/token，只算文本）估算，下界都超 983,616 的直接本地拒绝，省一次上游往返；灰区一律放行交给上游裁判
+2. **错误翻译**：上游 413 / 网关 `PAYLOAD_TOO_LARGE` / 巨体请求(≥1.5M字符)的 504，全部翻译成 OpenAI 规范 `context_length_exceeded`（message 含 "maximum context length"）——同时命中 Hermes 分类器的 code 表与 pattern 表，触发其自动压缩恢复
+3. **流内错误显式化**：上游会在 HTTP 200 的流里塞错误信封（旧行为被当空 delta 吞掉，客户端拿到假的"正常空回复"），现在识别信封结构（statusCode/headers 键 + 内层无 choices）并显式抛错转译；正常回复文本含 `provider_error` 字样不误伤
+
+超限/超时同时不计入账号故障（与 busy、不支持模型同类）。客户端侧建议：单条请求字符数控制在 1M 以内，大素材分段发。
